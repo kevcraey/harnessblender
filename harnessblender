@@ -710,6 +710,81 @@ def summary(mix: dict, has_hook: bool) -> str:
     return f"skills={c['skill']} agents={c['agent']} richtlijnen={c['richtlijn']} mcps={c['mcp']}{hk}"
 
 
+PANTRY_README = """# pantry/
+
+Your own ingredients. Discovery works by convention, walked recursively from here (and from
+each `store/<name>/`):
+
+- **skill**    — any directory containing `SKILL.md`, at any depth, any parent folder name.
+- **agent**    — a directory literally named `agents`; its direct `.md` files (or `<naam>/<naam>.md`) become agents.
+- **richtlijn**— a directory literally named `richtlijnen`; its direct `.md` files become richtlijnen
+                 (a `README.md` there installs as `CLAUDE.md`).
+- **mcp**      — a directory literally named `mcp-servers`; each immediate subdirectory that declares
+                 `mcpServers` via `.mcp.json`, `.claude-plugin/.mcp.json`, `.claude-plugin/plugin.json`
+                 or `server.json` becomes one mcp ingredient.
+- **plugin**   — any directory containing `.claude-plugin/plugin.json` directly, anywhere. Not merged
+                 into a blend: copied verbatim and registered as its own marketplace entry. The
+                 `plugins/` folder name here is just a suggested landing spot, not a discovery trigger.
+
+`skills/` and `plugins/` are suggested groupings, not required names — put a skill anywhere as
+long as it has a `SKILL.md`. `agents/`, `richtlijnen/` and `mcp-servers/` ARE required names:
+discovery only fires on that exact directory name.
+"""
+
+
+def cmd_init(args) -> None:
+    target = Path(args.path).expanduser().resolve()
+    if (target / "cookbook.yaml").exists():
+        sys.exit(f"already a cookbook: {target}")
+    target.mkdir(parents=True, exist_ok=True)
+    if any(target.iterdir()):
+        sys.exit(f"target not empty: {target} (init needs an empty or new directory)")
+
+    name = args.name or target.name
+    (target / "cookbook.yaml").write_text(
+        "# harnessblender-cookbook marker file.\n"
+        f"name: {name}\n"
+        "owner:\n"
+        '  name: ""\n'
+        '  url: ""\n'
+        "\n"
+        "exclude_dirs:\n"
+    )
+    (target / "store.yaml").write_text(
+        "# External sources harnessblender can fetch (\"store items\"). Each `name` is cloned to\n"
+        "# `store/<name>/` (gitignored) — `harnessblender fetch` clones if missing, ff-only pulls\n"
+        "# if it already exists.\n"
+        "#\n"
+        "# sources:\n"
+        "#   - name: some-skill-repo\n"
+        "#     url: git@github.com:someone/some-skill-repo.git\n"
+        "sources: []\n"
+    )
+    (target / "pantry").mkdir()
+    (target / "pantry" / "README.md").write_text(PANTRY_README)
+    for sub in ("skills", "agents", "richtlijnen", "mcp-servers", "plugins"):
+        d = target / "pantry" / sub
+        d.mkdir()
+        (d / ".gitkeep").touch()
+    (target / "recipes").mkdir()
+    (target / "recipes" / ".gitkeep").touch()
+    (target / "store").mkdir()
+    (target / "store" / ".gitkeep").touch()
+    (target / ".gitignore").write_text(
+        ".DS_Store\n"
+        "\n"
+        "# store/: gitignored checkouts of external sources declared in store.yaml.\n"
+        "store/*\n"
+        "!store/.gitkeep\n"
+        "\n"
+        "# recipes/<naam>/blend/: generated output per recipe, regenerable via `harnessblender blend`.\n"
+        "recipes/*/blend/\n"
+    )
+    print(f"cookbook created: {target}")
+    print("next: drop ingredients under pantry/ (see pantry/README.md), add store.yaml sources,")
+    print(f"then: harnessblender --cookbook {target} new-recipe <naam>")
+
+
 def cmd_new_recipe(args) -> None:
     config = load_config()
     if recipe_path(args.recipe).exists():
@@ -1108,6 +1183,11 @@ def main() -> None:
     p.add_argument("--cookbook", help="path to the cookbook (default: walk up from cwd for cookbook.yaml)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    pi = sub.add_parser("init", help="scaffold a new, empty cookbook")
+    pi.add_argument("path", nargs="?", default=".", help="directory to create the cookbook in (default: .)")
+    pi.add_argument("--name", help="cookbook name (default: target directory name)")
+    pi.set_defaults(func=cmd_init)
+
     pn = sub.add_parser("new-recipe", help="create a new recipe (picker) and blend it")
     pn.add_argument("recipe")
     pn.set_defaults(func=cmd_new_recipe)
@@ -1138,6 +1218,9 @@ def main() -> None:
     pw.set_defaults(func=cmd_web)
 
     args = p.parse_args()
+    if args.cmd == "init":
+        cmd_init(args)
+        return
     global ROOT
     ROOT = find_cookbook(args.cookbook)
     args.func(args)
