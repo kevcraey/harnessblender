@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>mix-plugin</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <aside id="sidebar">
+    <h1>mix-plugin</h1>
+    <button id="new-btn" class="variant new">+ nieuwe variant</button>
+    <ul id="variant-list"></ul>
+
+    <section id="blacklist">
+      <h2>uitgesloten mappen</h2>
+      <div id="bl-chips"></div>
+      <input id="bl-input" type="text" placeholder="map-naam + enter" autocomplete="off" />
+    </section>
+  </aside>
+
+  <main id="main">
+    <header id="head">
+      <div class="row">
+        <label>naam
+          <input id="variant-name" type="text" placeholder="my-variant" autocomplete="off" />
+        </label>
+        <span id="counts" class="counts"></span>
+      </div>
+      <label class="desc">beschrijving
+        <input id="variant-desc" type="text" placeholder="korte beschrijving" autocomplete="off" />
+      </label>
+    </header>
+
+    <div id="sections"></div>
+
+    <footer id="foot">
+      <span id="status"></span>
+      <button id="save-btn">opslaan</button>
+    </footer>
+  </main>
+
+  <div id="toast" class="hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

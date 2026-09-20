@@ -1,0 +1,1072 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "questionary>=2.0",
+#   "pyyaml>=6",
+# ]
+# ///
+"""harnessblender: blend ingredients (skills + agents + richtlijnen + mcp servers) from a
+cookbook into installable Claude Code plugins ("blends"), and pour them into projects.
+
+Terminology:
+  ingredients = pantry (your own skills/agents/richtlijnen/mcp-servers) + store
+                (external sources, declared in store.yaml, cloned into store/<name>/ — gitignored)
+  recipe      = a chosen selection of ingredients, saved in recipes/<naam>/recipe.yaml
+  blend       = build a recipe into recipes/<naam>/blend/: real copies (no symlinks) + plugin.json +
+                provenance, so a blend is self-contained and transferable
+  cookbook    = the directory holding pantry/, store/, recipes/ — found by walking up from the
+                current directory for a `cookbook.yaml` marker file (or --cookbook)
+  pour        = install a blend into a "drinker" (a project folder) via the Claude Code CLI
+
+harnessblender itself carries no personal content — everything specific lives in a cookbook.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import webbrowser
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import questionary
+import yaml
+
+TOOL_DIR = Path(__file__).resolve().parent
+ROOT: Path  # set by find_cookbook() at startup, once args are parsed
+
+# kind <-> plural mapping. richtlijn = los .md-bestand uit een `richtlijnen`-map.
+KIND_PLURAL = {"skill": "skills", "agent": "agents", "richtlijn": "richtlijnen", "mcp": "mcps"}
+PLURAL_KIND = {v: k for k, v in KIND_PLURAL.items()}
+PLURALS = ("skills", "agents", "richtlijnen", "mcps")
+# Soorten die als kopie in de blend belanden. mcps niet: die worden in
+# plugin.json onder `mcpServers` samengevoegd (geen bestand om te kopiëren).
+COPY_PLURALS = ("skills", "agents", "richtlijnen")
+
+# Junk die nooit mee in een gekopieerde skill-map mag (bloat / niet-overdraagbaar).
+COPY_IGNORE = shutil.ignore_patterns(
+    "__pycache__", "node_modules", ".git", ".venv", "venv", ".DS_Store", "*.pyc"
+)
+
+# Hook-bundel die in een blend beland zodra er richtlijnen geselecteerd zijn.
+# hooks/hooks.json wordt auto-ontdekt door Claude Code (geen plugin.json-veld nodig).
+HOOKS_JSON = {
+    "hooks": {
+        "SessionStart": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/link-richtlijnen.sh"',
+                    }
+                ],
+            }
+        ]
+    }
+}
+
+LINK_SCRIPT = """#!/usr/bin/env bash
+# Symlinkt de richtlijnen van deze plugin in het actieve project.
+# Geleverd door harnessblender; draait bij elke SessionStart. Idempotent.
+src="${CLAUDE_PLUGIN_ROOT}/richtlijnen"
+dst="${CLAUDE_PROJECT_DIR:-$PWD}/richtlijnen"
+[ -d "$src" ] || exit 0
+# Niet clobberen als er al een ECHTE map staat (bv. nog-getrackte richtlijnen).
+if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+  exit 0
+fi
+ln -sfn "$src" "$dst" 2>/dev/null || true
+exit 0
+"""
+
+
+# ── cookbook resolution ─────────────────────────────────────────────────────
+
+def find_cookbook(explicit: str | None) -> Path:
+    """Resolve the cookbook root: --cookbook if given, else walk up from cwd
+    looking for a `cookbook.yaml` marker file."""
+    if explicit:
+        p = Path(explicit).expanduser().resolve()
+        if not (p / "cookbook.yaml").is_file():
+            sys.exit(f"not a cookbook (no cookbook.yaml here): {p}")
+        return p
+    cur = Path.cwd()
+    for d in (cur, *cur.parents):
+        if (d / "cookbook.yaml").is_file():
+            return d
+    sys.exit("no cookbook found (no cookbook.yaml in this dir or any parent). Pass --cookbook <path>.")
+
+
+def load_config() -> dict:
+    path = ROOT / "cookbook.yaml"
+    if not path.exists():
+        sys.exit(f"missing config: {path}")
+    data = yaml.safe_load(path.read_text()) or {}
+    data.setdefault("name", ROOT.name)
+    return data
+
+
+def load_store() -> list[dict]:
+    path = ROOT / "store.yaml"
+    if not path.exists():
+        return []
+    return (yaml.safe_load(path.read_text()) or {}).get("sources") or []
+
+
+def scan_roots() -> list[str]:
+    """Vaste scan-bases: pantry/ + elke store/<name>/. Geen configureerbare scan_bases meer."""
+    roots = ["pantry"]
+    store_dir = ROOT / "store"
+    if store_dir.is_dir():
+        roots += [f"store/{d.name}" for d in sorted(store_dir.iterdir())
+                  if d.is_dir() and not d.name.startswith(".")]
+    return roots
+
+
+@dataclass(frozen=True)
+class Item:
+    kind: str          # "skill" | "agent" | "richtlijn" | "mcp"
+    root_label: str    # scan-root display (e.g. "pantry/skills" or "store/caveman/skills")
+    name: str          # source basename (default plugin-side name)
+    source: Path       # absolute path to source dir or file
+
+
+def default_as(it: Item) -> str:
+    """Default plugin-side naam. Een richtlijnen-README.md wordt als CLAUDE.md geladen."""
+    if it.kind == "richtlijn" and it.name == "README.md":
+        return "CLAUDE.md"
+    return it.name
+
+
+def default_as_for(kind: str, name: str) -> str:
+    if kind == "richtlijn" and name == "README.md":
+        return "CLAUDE.md"
+    return name
+
+
+# Mappen die we tijdens de walk nooit binnengaan.
+EXCLUDE_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv"}
+
+
+def _collect_agents(d: Path, label: str, items: list[Item], seen: set[str]) -> None:
+    for entry in sorted(d.iterdir()):
+        is_agent = (entry.is_file() and entry.suffix == ".md") or (
+            entry.is_dir() and (entry / f"{entry.name}.md").exists()
+        )
+        if is_agent and str(entry) not in seen:
+            seen.add(str(entry))
+            items.append(Item("agent", label, entry.name, entry))
+
+
+def _collect_richtlijnen(d: Path, label: str, items: list[Item], seen: set[str]) -> None:
+    for entry in sorted(d.iterdir()):
+        if entry.is_file() and entry.suffix == ".md" and str(entry) not in seen:
+            seen.add(str(entry))
+            items.append(Item("richtlijn", label, entry.name, entry))
+
+
+# MCP-registry runtimeHint -> (command, prefix-args). Het registry-formaat (server.json)
+# beschrijft een pakket i.p.v. een kant-en-klare mcpServers-config; voor de simpele
+# gevallen (alleen identifier + runtimeHint) leiden we het launch-commando hieruit af.
+_REGISTRY_RUNNERS = {
+    "npx": ("npx", ["-y"]),
+    "uvx": ("uvx", []),
+    "dnx": ("dnx", []),
+}
+_REGISTRY_TYPE_RUNNER = {"npm": "npx", "pypi": "uvx", "nuget": "dnx"}
+
+
+def _servers_from_registry(src: Path) -> dict:
+    try:
+        data = json.loads(src.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    packages = data.get("packages")
+    if not isinstance(packages, list):
+        return {}
+    order = {"npm": 0, "pypi": 1, "nuget": 2}
+    candidates = [p for p in packages if isinstance(p, dict)
+                  and (p.get("transport") or {}).get("type", "stdio") == "stdio"]
+    candidates.sort(key=lambda p: order.get(p.get("registryType"), 9))
+    for pkg in candidates:
+        if pkg.get("runtimeArguments") or pkg.get("packageArguments") or pkg.get("environmentVariables"):
+            continue
+        ident = pkg.get("identifier")
+        runner = pkg.get("runtimeHint") or _REGISTRY_TYPE_RUNNER.get(pkg.get("registryType"))
+        if not ident or runner not in _REGISTRY_RUNNERS:
+            continue
+        command, prefix = _REGISTRY_RUNNERS[runner]
+        return {src.parent.name: {"command": command, "args": [*prefix, ident]}}
+    return {}
+
+
+def _servers_from_file(src: Path) -> dict:
+    if src.name == "server.json":
+        return _servers_from_registry(src)
+    try:
+        data = json.loads(src.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    servers = data.get("mcpServers")
+    if isinstance(servers, dict):
+        return servers
+    if src.name == ".mcp.json":
+        return {k: v for k, v in data.items() if isinstance(v, dict)}
+    return {}
+
+
+def _mcp_source(sub: Path) -> tuple[Path, dict] | None:
+    for cand in (sub / ".mcp.json", sub / ".claude-plugin" / ".mcp.json",
+                 sub / ".claude-plugin" / "plugin.json", sub / "server.json"):
+        if cand.is_file():
+            servers = _servers_from_file(cand)
+            if servers:
+                return cand, servers
+    return None
+
+
+def _collect_mcps(d: Path, label: str, items: list[Item], seen: set[str]) -> None:
+    for sub in sorted(d.iterdir()):
+        if not sub.is_dir() or sub.name.startswith("."):
+            continue
+        found = _mcp_source(sub)
+        if found is None or str(sub) in seen:
+            continue
+        seen.add(str(sub))
+        items.append(Item("mcp", label, sub.name, found[0]))
+
+
+def discover_sources(bases: list[str], exclude_dirs: list[str] | None = None) -> list[Item]:
+    """Walk `bases` (pantry/ + store/<name>/) en ontdek bronnen op conventie.
+
+    - map met SKILL.md           -> skill   (gegroepeerd onder z'n ouder-map)
+    - map genaamd `agents`       -> agents  (z'n .md / <naam>/<naam>.md entries)
+    - map genaamd `richtlijnen`  -> richtlijnen (z'n losse .md-bestanden)
+    - map genaamd `mcp-servers`  -> mcps    (submappen die mcpServers declareren)
+    """
+    items: list[Item] = []
+    seen: set[str] = set()
+    excluded = EXCLUDE_DIRS | set(exclude_dirs or ())
+    for base_raw in bases:
+        base = (ROOT / base_raw).resolve()
+        if not base.is_dir():
+            print(f"warn: scan root missing: {base_raw}", file=sys.stderr)
+            continue
+
+        for dirpath, dirnames, _ in os.walk(base):
+            d = Path(dirpath).resolve()
+            dirnames[:] = [x for x in dirnames if not x.startswith(".") and x not in excluded]
+
+            if d.name == "agents":
+                _collect_agents(d, relpath(d), items, seen)
+                dirnames[:] = []
+                continue
+            if d.name == "richtlijnen":
+                _collect_richtlijnen(d, relpath(d), items, seen)
+                dirnames[:] = []
+                continue
+            if d.name == "mcp-servers":
+                _collect_mcps(d, relpath(d), items, seen)
+                dirnames[:] = []
+                continue
+            if (d / "SKILL.md").exists():
+                if str(d) not in seen:
+                    seen.add(str(d))
+                    items.append(Item("skill", relpath(d.parent), d.name, d))
+                dirnames[:] = []
+                continue
+    return items
+
+
+def recipe_dir(name: str) -> Path:
+    return ROOT / "recipes" / name
+
+
+def recipe_path(name: str) -> Path:
+    return recipe_dir(name) / "recipe.yaml"
+
+
+def blend_dir(name: str) -> Path:
+    return recipe_dir(name) / "blend"
+
+
+def read_recipe(name: str) -> dict:
+    p = recipe_path(name)
+    return yaml.safe_load(p.read_text()) if p.exists() else {}
+
+
+def collect_preselected(current: dict) -> set[str]:
+    pre: set[str] = set()
+    sels = (current.get("selections") or {})
+    for plural in PLURALS:
+        for sel in (sels.get(plural) or []):
+            src = sel.get("source")
+            if src:
+                pre.add(str((ROOT / src).resolve()))
+    return pre
+
+
+def build_choices(items: list[Item], preselected_abs: set[str], richtlijn_check_all: bool) -> list:
+    grouped: dict[str, list[Item]] = {}
+    for it in items:
+        grouped.setdefault(it.root_label, []).append(it)
+
+    choices: list = []
+    for root_label in sorted(grouped):
+        choices.append(questionary.Separator(f"── {root_label} ──"))
+        for it in sorted(grouped[root_label], key=lambda x: x.name):
+            checked = str(it.source) in preselected_abs
+            if it.kind == "richtlijn" and richtlijn_check_all:
+                checked = True
+            choices.append(questionary.Choice(title=it.name, value=it, checked=checked))
+    return choices
+
+
+PICK_STEPS = [
+    ("skill", "SKILLS"),
+    ("agent", "AGENTS"),
+    ("richtlijn", "richtlijnen"),
+    ("mcp", "MCP SERVERS"),
+]
+
+
+def run_picker(items: list[Item], current: dict) -> list[Item]:
+    pre = collect_preselected(current)
+    richtlijn_check_all = "richtlijnen" not in (current.get("selections") or {})
+    if not items:
+        sys.exit("no ingredients found in pantry/ or store/.")
+
+    selected: list[Item] = []
+    for idx, (kind, label) in enumerate(PICK_STEPS, start=1):
+        kind_items = [it for it in items if it.kind == kind]
+        if not kind_items:
+            continue
+        choices = build_choices(kind_items, pre, richtlijn_check_all)
+        result = questionary.checkbox(
+            f"[{idx}/{len(PICK_STEPS)}] {label} (space toggle, enter confirm):",
+            choices=choices,
+        ).ask()
+        if result is None:
+            sys.exit("cancelled.")
+        selected.extend(result)
+    return selected
+
+
+def existing_as_map(existing: dict) -> dict[tuple[str, str], str]:
+    out: dict[tuple[str, str], str] = {}
+    sels = existing.get("selections") or {}
+    for kind, plural in KIND_PLURAL.items():
+        for sel in (sels.get(plural) or []):
+            src = sel.get("source")
+            if not src:
+                continue
+            abs_src = str((ROOT / src).resolve())
+            out[(kind, abs_src)] = sel.get("as") or default_as_for(kind, Path(src).name)
+    return out
+
+
+def find_conflicts(selected: list[Item], existing: dict) -> list[str]:
+    existing_as = existing_as_map(existing)
+    final_names: dict[tuple[str, str], Item] = {}
+    msgs: list[str] = []
+    for it in selected:
+        key_source = (it.kind, str(it.source))
+        as_name = existing_as.get(key_source) or default_as(it)
+        final_key = (it.kind, as_name)
+        if final_key in final_names:
+            a = final_names[final_key]
+            msgs.append(f"{a.kind} '{as_name}': {a.root_label} <-> {it.root_label}")
+        else:
+            final_names[final_key] = it
+    return msgs
+
+
+def check_conflicts(selected: list[Item], existing: dict) -> None:
+    msgs = find_conflicts(selected, existing)
+    if msgs:
+        sys.exit("\n".join(
+            ["name conflicts — pick only one, or set `as:` rename in the recipe and re-run:"]
+            + [f"  {m}" for m in msgs]
+        ))
+
+
+def relpath(p: Path) -> str:
+    try:
+        return os.path.relpath(p, ROOT)
+    except ValueError:
+        return str(p)
+
+
+def write_recipe(name: str, description: str, version: str, selected: list[Item], existing: dict) -> None:
+    existing_as = existing_as_map(existing)
+    by_kind: dict[str, list[dict]] = {plural: [] for plural in PLURALS}
+    for it in selected:
+        plural = KIND_PLURAL[it.kind]
+        key = (it.kind, str(it.source))
+        as_name = existing_as.get(key) or default_as(it)
+        by_kind[plural].append({"source": relpath(it.source), "as": as_name})
+
+    data = {"description": description, "version": version, "selections": by_kind}
+    p = recipe_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+def recipe_names() -> list[str]:
+    recipes_dir = ROOT / "recipes"
+    if not recipes_dir.is_dir():
+        return []
+    return sorted(d.name for d in recipes_dir.iterdir()
+                  if d.is_dir() and not d.name.startswith(".") and (d / "recipe.yaml").is_file())
+
+
+def clear_dir(d: Path) -> None:
+    if not d.exists():
+        return
+    for child in d.iterdir():
+        if child.is_symlink() or child.is_file():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+
+
+def rebuild_items(blend: Path, mix: dict) -> None:
+    sels = mix.get("selections") or {}
+    for plural in COPY_PLURALS:
+        d = blend / plural
+        clear_dir(d)
+        entries = sels.get(plural) or []
+        if not entries:
+            if d.exists():
+                shutil.rmtree(d)
+            continue
+        d.mkdir(parents=True, exist_ok=True)
+        for sel in entries:
+            src = (ROOT / sel["source"]).resolve()
+            if not src.exists():
+                print(f"warn: source missing, skipping: {sel['source']}", file=sys.stderr)
+                continue
+            target = d / sel["as"]
+            if src.is_dir():
+                shutil.copytree(src, target, symlinks=False, ignore=COPY_IGNORE)
+            else:
+                shutil.copy2(src, target)
+
+
+def write_hooks(blend: Path, mix: dict) -> bool:
+    sels = mix.get("selections") or {}
+    has_richtlijnen = bool(sels.get("richtlijnen"))
+    hooks_dir = blend / "hooks"
+    if not has_richtlijnen:
+        if hooks_dir.exists():
+            shutil.rmtree(hooks_dir)
+        return False
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    (hooks_dir / "hooks.json").write_text(json.dumps(HOOKS_JSON, indent=2) + "\n")
+    script = hooks_dir / "link-richtlijnen.sh"
+    script.write_text(LINK_SCRIPT)
+    script.chmod(0o755)
+    return True
+
+
+def collect_mcp_servers(mix: dict) -> tuple[dict, list[str]]:
+    sels = mix.get("selections") or {}
+    servers: dict = {}
+    warnings: list[str] = []
+    for sel in (sels.get("mcps") or []):
+        src = (ROOT / sel["source"]).resolve()
+        if not src.exists():
+            warnings.append(f"mcp source missing, skipping: {sel['source']}")
+            continue
+        for key, cfg in _servers_from_file(src).items():
+            if key in servers:
+                warnings.append(f"duplicate MCP server '{key}' — keeping first")
+                continue
+            servers[key] = cfg
+    return servers, warnings
+
+
+def write_plugin_json(blend: Path, name: str, mix: dict) -> None:
+    plugin_dir = blend / ".claude-plugin"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    data = {
+        "name": name,
+        "description": mix.get("description", ""),
+        "version": mix.get("version", "0.1.0"),
+    }
+    servers, warns = collect_mcp_servers(mix)
+    for w in warns:
+        print(f"warn: {w}", file=sys.stderr)
+    if servers:
+        data["mcpServers"] = servers
+    (plugin_dir / "plugin.json").write_text(json.dumps(data, indent=2) + "\n")
+
+
+def write_marketplace_json(config: dict) -> None:
+    market_dir = ROOT / ".claude-plugin"
+    market_dir.mkdir(parents=True, exist_ok=True)
+    plugins = []
+    for name in recipe_names():
+        manifest = blend_dir(name) / ".claude-plugin" / "plugin.json"
+        if not manifest.exists():
+            continue
+        meta = json.loads(manifest.read_text())
+        plugins.append({
+            "name": meta["name"],
+            "description": meta.get("description", ""),
+            "source": f"./recipes/{name}/blend",
+        })
+    data = {
+        "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+        "name": config.get("name") or ROOT.name,
+        "description": "Personal cookbook: blended skills + agents + richtlijnen + mcp servers",
+        "owner": config.get("owner") or {"name": "Kenzo"},
+        "plugins": plugins,
+    }
+    (market_dir / "marketplace.json").write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ── provenance ──────────────────────────────────────────────────────────────
+
+def _git(cwd: Path, *args: str, timeout: float = 10) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), *args],
+                           capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _git_raw(cwd: Path, *args: str, timeout: float = 10) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), *args],
+                           capture_output=True, text=True, timeout=timeout,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+_repo_cache: dict[Path, dict] = {}
+
+
+def _repo_info(top: Path) -> dict:
+    if top not in _repo_cache:
+        _repo_cache[top] = {
+            "remote": _git(top, "remote", "get-url", "origin") or "",
+            "commit": _git(top, "rev-parse", "HEAD") or "",
+        }
+    return _repo_cache[top]
+
+
+def provenance_of(src: Path) -> dict:
+    probe = src if src.is_dir() else src.parent
+    top = _git(probe, "rev-parse", "--show-toplevel")
+    if not top:
+        return {"versioned": False, "local": relpath(src)}
+    top_path = Path(top)
+    info = _repo_info(top_path)
+    rel = os.path.relpath(src.resolve(), top_path)
+    untracked = _git(top_path, "cat-file", "-e", f"HEAD:{rel}") is None
+    dirty = bool(_git(top_path, "status", "--porcelain", "--untracked-files=no", "--", rel))
+    return {
+        "versioned": True,
+        "remote": info["remote"],
+        "commit": info["commit"],
+        "untracked": untracked,
+        "dirty": dirty,
+        "path": rel,
+    }
+
+
+def build_provenance(mix: dict) -> list[dict]:
+    sels = mix.get("selections") or {}
+    out: list[dict] = []
+    for kind, plural in KIND_PLURAL.items():
+        if plural == "mcps":
+            continue
+        for sel in (sels.get(plural) or []):
+            src = (ROOT / sel["source"]).resolve()
+            rec = {"kind": kind, "as": sel.get("as") or Path(sel["source"]).name,
+                   "source": sel["source"]}
+            rec.update(provenance_of(src) if src.exists() else {"versioned": False, "local": sel["source"]})
+            out.append(rec)
+    return out
+
+
+def write_provenance(blend: Path, name: str, mix: dict) -> None:
+    items = build_provenance(mix)
+    (blend / "provenance.json").write_text(
+        json.dumps({"blend": name, "generated_by": "harnessblender", "items": items}, indent=2) + "\n")
+
+    lines = [
+        f"# Provenance — {name}",
+        "",
+        "Auto-gegenereerd door harnessblender. Elk item is een **kopie** uit z'n bron op het",
+        f"getoonde commit. Wijzig aan de bron (pantry/ of store/) en draai `harnessblender blend "
+        f"{name}` om de kopie + deze provenance te verversen.",
+        "",
+    ]
+    for kind, plural in KIND_PLURAL.items():
+        if plural == "mcps":
+            continue
+        group = [it for it in items if it["kind"] == kind]
+        if not group:
+            continue
+        lines.append(f"## {plural}")
+        for it in sorted(group, key=lambda x: x["as"]):
+            if not it.get("versioned"):
+                lines.append(f"- **{it['as']}** ← ⚠ niet onder versiebeheer (lokaal: `{it.get('local','?')}`)")
+                continue
+            remote = it.get("remote") or "(geen origin-remote)"
+            commit = (it.get("commit") or "")[:12] or "?"
+            if it.get("untracked"):
+                lines.append(f"- **{it['as']}** ← `{remote}` · `{it['path']}` ⚠ untracked (nog niet in commit `{commit}`)")
+                continue
+            dirty = " ⚠ dirty" if it.get("dirty") else ""
+            lines.append(f"- **{it['as']}** ← `{remote}` · `{it['path']}` @ `{commit}`{dirty}")
+        lines.append("")
+    (blend / "PROVENANCE.md").write_text("\n".join(lines))
+
+
+def apply(name: str, mix: dict, config: dict) -> bool:
+    blend = blend_dir(name)
+    rebuild_items(blend, mix)
+    has_hook = write_hooks(blend, mix)
+    write_plugin_json(blend, name, mix)
+    write_provenance(blend, name, mix)
+    write_marketplace_json(config)
+    return has_hook
+
+
+def counts(mix: dict) -> dict[str, int]:
+    sels = mix.get("selections") or {}
+    return {kind: len(sels.get(plural) or []) for kind, plural in KIND_PLURAL.items()}
+
+
+def summary(mix: dict, has_hook: bool) -> str:
+    c = counts(mix)
+    hk = " + richtlijnen-hook" if has_hook else ""
+    return f"skills={c['skill']} agents={c['agent']} richtlijnen={c['richtlijn']} mcps={c['mcp']}{hk}"
+
+
+def cmd_new_recipe(args) -> None:
+    config = load_config()
+    if recipe_path(args.recipe).exists():
+        sys.exit(f"recipe '{args.recipe}' already exists. use `edit-recipe`.")
+    description = questionary.text("description for recipe:").ask()
+    if description is None:
+        sys.exit("cancelled.")
+
+    items = discover_sources(scan_roots(), config.get("exclude_dirs"))
+    selected = run_picker(items, {})
+    check_conflicts(selected, {})
+
+    write_recipe(args.recipe, description or "", "0.1.0", selected, {})
+    mix = read_recipe(args.recipe)
+    has_hook = apply(args.recipe, mix, config)
+    print(f"new recipe '{args.recipe}', blended: {summary(mix, has_hook)}.")
+
+
+def cmd_edit_recipe(args) -> None:
+    config = load_config()
+    if not recipe_path(args.recipe).exists():
+        sys.exit(f"no such recipe '{args.recipe}'. use `new-recipe`.")
+    existing = read_recipe(args.recipe)
+    items = discover_sources(scan_roots(), config.get("exclude_dirs"))
+    selected = run_picker(items, existing)
+    check_conflicts(selected, existing)
+    description = existing.get("description", "")
+    version = existing.get("version", "0.1.0")
+    write_recipe(args.recipe, description, version, selected, existing)
+    mix = read_recipe(args.recipe)
+    has_hook = apply(args.recipe, mix, config)
+    print(f"updated recipe '{args.recipe}', re-blended: {summary(mix, has_hook)}.")
+
+
+def cmd_blend(args) -> None:
+    config = load_config()
+    if not recipe_path(args.recipe).exists():
+        sys.exit(f"no such recipe '{args.recipe}'.")
+    mix = read_recipe(args.recipe)
+    if not mix:
+        sys.exit(f"recipe '{args.recipe}' is empty.")
+    has_hook = apply(args.recipe, mix, config)
+    print(f"blended '{args.recipe}': {summary(mix, has_hook)}.")
+
+
+def cmd_list(args) -> None:
+    names = recipe_names()
+    if not names:
+        print("  (no recipes — run `harnessblender new-recipe <name>`)")
+        return
+    for name in names:
+        mix = read_recipe(name)
+        c = counts(mix)
+        hook = "hook" if c["richtlijn"] else "    "
+        blended = "blended" if blend_dir(name).exists() else "not blended"
+        desc = mix.get("description", "")
+        print(f"  {name:20s}  s={c['skill']:<3d} a={c['agent']:<3d} r={c['richtlijn']:<3d} "
+              f"m={c['mcp']:<3d} {hook}  [{blended}]  {desc}")
+
+
+# ── fetch: clone-if-missing + ff-only pull for every store source ───────────
+
+def update_repo(repo: Path) -> dict:
+    """Fetch + ff-only merge. Never auto-stashes or force-merges — a dirty tree,
+    detached HEAD, or diverged branch is reported and left untouched."""
+    label = relpath(repo)
+    branch = _git(repo, "symbolic-ref", "-q", "--short", "HEAD")
+    if not branch:
+        head = _git(repo, "rev-parse", "--short", "HEAD") or "?"
+        return {"repo": repo, "label": label, "status": "skipped",
+                "reason": f"detached HEAD @ {head} (pinned on purpose?), not auto-updated"}
+
+    dirty = _git_raw(repo, "status", "--porcelain", "--untracked-files=no")
+    if dirty:
+        paths = ", ".join(line[3:] for line in dirty.strip("\n").splitlines()[:5])
+        return {"repo": repo, "label": label, "status": "skipped",
+                "reason": f"dirty (tracked changes): {paths}"}
+
+    old = _git(repo, "rev-parse", "HEAD")
+    if _git(repo, "fetch", "origin", timeout=120) is None:
+        return {"repo": repo, "label": label, "status": "error", "reason": "git fetch failed (network/auth?)"}
+
+    if _git(repo, "merge", "--ff-only", f"origin/{branch}", timeout=30) is None:
+        return {"repo": repo, "label": label, "status": "skipped",
+                "reason": f"diverged from origin/{branch} (not fast-forwardable), left untouched"}
+
+    new = _git(repo, "rev-parse", "HEAD")
+    if old == new:
+        return {"repo": repo, "label": label, "status": "up-to-date", "commit": new}
+    commits = (_git(repo, "log", "--oneline", f"{old}..{new}") or "").splitlines()
+    return {"repo": repo, "label": label, "status": "updated", "old": old, "new": new, "commits": commits}
+
+
+def clone_repo(name: str, url: str) -> dict:
+    dest = ROOT / "store" / name
+    label = relpath(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(["git", "clone", "--quiet", url, str(dest)],
+                        capture_output=True, text=True,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    if r.returncode != 0:
+        return {"repo": dest, "label": label, "status": "error",
+                "reason": f"git clone failed: {r.stderr.strip()[:200]}"}
+    commit = _git(dest, "rev-parse", "--short", "HEAD") or "?"
+    return {"repo": dest, "label": label, "status": "cloned", "commit": commit}
+
+
+def stale_blends(updated: list[dict]) -> list[dict]:
+    """Cross-check every blend's provenance.json against store repos that moved."""
+    moved = [u for u in updated if u["status"] == "updated"]
+    if not moved:
+        return []
+    out: list[dict] = []
+    for name in recipe_names():
+        prov_path = blend_dir(name) / "provenance.json"
+        if not prov_path.exists():
+            continue
+        try:
+            items = json.loads(prov_path.read_text()).get("items") or []
+        except (OSError, json.JSONDecodeError):
+            continue
+        for item in items:
+            if not item.get("versioned"):
+                continue
+            src = (ROOT / item["source"]).resolve()
+            for u in moved:
+                try:
+                    src.relative_to(u["repo"])
+                except ValueError:
+                    continue
+                if item.get("commit") != u["new"]:
+                    out.append({"blend": name, "item": item.get("as") or item["source"],
+                                "kind": item.get("kind"), "repo_label": u["label"],
+                                "old": (item.get("commit") or "")[:7], "new": u["new"][:7]})
+                break
+    return out
+
+
+def cmd_fetch(args) -> None:
+    sources = load_store()
+    if not sources:
+        sys.exit("no sources in store.yaml.")
+
+    results: list[dict] = []
+    for src in sources:
+        name, url = src.get("name"), src.get("url")
+        if not name or not url:
+            print(f"warn: skipping malformed store.yaml entry: {src}", file=sys.stderr)
+            continue
+        dest = ROOT / "store" / name
+        if (dest / ".git").exists():
+            results.append(update_repo(dest))
+        else:
+            results.append(clone_repo(name, url))
+
+    for r in results:
+        print(f"== {r['label']} ==")
+        if r["status"] == "cloned":
+            print(f"  cloned ({r['commit']})")
+        elif r["status"] == "up-to-date":
+            print(f"  up to date ({r['commit'][:7]})")
+        elif r["status"] == "updated":
+            n = len(r["commits"])
+            print(f"  {n} new commit{'s' if n != 1 else ''} ({r['old'][:7]}..{r['new'][:7]}):")
+            for line in r["commits"][:8]:
+                print(f"    {line}")
+            if n > 8:
+                print(f"    ... and {n - 8} more")
+        elif r["status"] == "skipped":
+            print(f"  SKIPPED: {r['reason']}")
+        else:
+            print(f"  ERROR: {r['reason']}")
+        print()
+
+    stale = stale_blends(results)
+    if stale:
+        print("== stale blends (store source moved since last blend) ==")
+        for s in stale:
+            print(f"  {s['blend']}: {s['item']} ({s['kind']}) — {s['old']}..{s['new']}  [{s['repo_label']}]")
+        print("\nRun `harnessblender blend <recipe>` to refresh.")
+    elif any(r["status"] == "updated" for r in results):
+        print("No blend items were affected by these updates.")
+
+
+# ── pour: install a blend into a project via the Claude Code CLI ───────────
+
+def cmd_pour(args) -> None:
+    config = load_config()
+    name = config.get("name") or ROOT.name
+    if not blend_dir(args.recipe).exists():
+        sys.exit(f"recipe '{args.recipe}' has not been blended yet — run `harnessblender blend {args.recipe}` first.")
+
+    for drinker in args.drinkers:
+        target = Path(drinker).expanduser().resolve()
+        if not target.is_dir():
+            print(f"skip {drinker}: not a directory", file=sys.stderr)
+            continue
+        print(f"== pouring '{args.recipe}' into {target} (scope={args.scope}) ==")
+        add = subprocess.run(["claude", "plugin", "marketplace", "add", str(ROOT)],
+                             cwd=target, capture_output=True, text=True)
+        if add.returncode != 0:
+            print(f"  marketplace add: {add.stdout.strip() or add.stderr.strip()} (continuing — likely already added)")
+        install = subprocess.run(
+            ["claude", "plugin", "install", f"{args.recipe}@{name}", "--scope", args.scope, "-y"],
+            cwd=target, capture_output=True, text=True)
+        if install.returncode != 0:
+            print(f"  ERROR: {install.stdout.strip() or install.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  {install.stdout.strip() or 'poured.'}")
+
+
+# ── web UI (stdlib only) ─────────────────────────────────────────────────────
+
+WEB_DIR = TOOL_DIR / "web"
+DEFAULT_PORT = 17345
+CONTENT_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css"}
+
+
+def list_variants() -> list[dict]:
+    """Alle recipes + hun huidige selectie (source-relpaths) voor de web-UI.
+    (Veldnamen blijven `variant`/`variants` — dat is het JSON-contract dat app.js verwacht.)"""
+    out: list[dict] = []
+    for name in recipe_names():
+        mix = read_recipe(name)
+        sels = mix.get("selections") or {}
+        sources = [sel["source"] for plural in PLURALS for sel in (sels.get(plural) or []) if sel.get("source")]
+        out.append({
+            "name": name,
+            "description": mix.get("description", ""),
+            "counts": counts(mix),
+            "sources": sources,
+        })
+    return out
+
+
+def web_state(items: list[Item], config: dict) -> dict:
+    return {
+        "items": [
+            {"kind": it.kind, "root_label": it.root_label, "name": it.name,
+             "source": relpath(it.source), "as": default_as(it)}
+            for it in items
+        ],
+        "variants": list_variants(),
+        "scan_bases": scan_roots(),
+        "exclude_dirs": list(config.get("exclude_dirs") or []),
+    }
+
+
+def write_config(data: dict) -> None:
+    """Herschrijft cookbook.yaml (behoudt name/owner/exclude_dirs mét commentaar)."""
+    owner = data.get("owner") or {"name": "Kenzo", "url": ""}
+    lines = [
+        "# harnessblender-cookbook marker file.",
+        f"name: {data.get('name') or ROOT.name}",
+        "owner:",
+        f"  name: {owner.get('name', 'Kenzo')}",
+        f'  url: "{owner.get("url", "")}"',
+        "",
+        "exclude_dirs:",
+    ]
+    lines += [f"  - {e}" for e in (data.get("exclude_dirs") or [])]
+    (ROOT / "cookbook.yaml").write_text("\n".join(lines) + "\n")
+
+
+def save_variant(config: dict, items: list[Item], payload: dict) -> dict:
+    """Schrijf/overschrijf + blend een recipe vanuit een web-payload. Raise ValueError op fout."""
+    name = (payload.get("variant") or "").strip()
+    if not name or name.startswith(".") or "/" in name or os.sep in name:
+        raise ValueError("invalid recipe name")
+    existing = read_recipe(name)
+
+    by_rel = {relpath(it.source): it for it in items}
+    selected = [by_rel[r] for r in (payload.get("sources") or []) if r in by_rel]
+
+    conflicts = find_conflicts(selected, existing)
+    if conflicts:
+        raise ValueError("name conflicts:\n" + "\n".join(conflicts))
+
+    description = payload.get("description")
+    if description is None:
+        description = existing.get("description", "")
+    version = existing.get("version", "0.1.0")
+
+    write_recipe(name, description, version, selected, existing)
+    mix = read_recipe(name)
+    has_hook = apply(name, mix, config)
+    return {"ok": True, "counts": counts(mix), "hook": has_hook}
+
+
+def make_handler(config: dict):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_a):
+            pass
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _static(self, rel: str):
+            safe = (WEB_DIR / rel).resolve()
+            if WEB_DIR not in safe.parents and safe != WEB_DIR or not safe.is_file():
+                self.send_error(404)
+                return
+            body = safe.read_bytes()
+            self.send_response(200)
+            self.send_header("content-type", CONTENT_TYPES.get(safe.suffix, "application/octet-stream"))
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/api/state":
+                items = discover_sources(scan_roots(), config.get("exclude_dirs"))
+                self._json(web_state(items, config))
+            elif self.path in ("/", "/index.html"):
+                self._static("index.html")
+            else:
+                self._static(self.path.lstrip("/"))
+
+        def do_POST(self):
+            if self.path not in ("/api/save", "/api/config"):
+                self.send_error(404)
+                return
+            length = int(self.headers.get("content-length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/api/config":
+                    raw = payload.get("exclude_dirs") or []
+                    clean = sorted({str(x).strip() for x in raw if str(x).strip() and "/" not in str(x)})
+                    config["exclude_dirs"] = clean
+                    write_config(config)
+                    items = discover_sources(scan_roots(), clean)
+                    self._json(web_state(items, config))
+                    return
+                items = discover_sources(scan_roots(), config.get("exclude_dirs"))
+                self._json(save_variant(config, items, payload))
+            except ValueError as e:
+                self._json({"error": str(e)}, code=409)
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"{type(e).__name__}: {e}"}, code=500)
+
+    return Handler
+
+
+def cmd_web(args) -> None:
+    config = load_config()
+    if not (WEB_DIR / "index.html").is_file():
+        sys.exit(f"missing web assets: {WEB_DIR}/index.html")
+    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(config))
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"harnessblender web → {url}  (cookbook: {ROOT})  (Ctrl-C to stop)")
+    if not args.no_open:
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped.")
+    finally:
+        httpd.server_close()
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="harnessblender",
+        description="blend ingredients (skills/agents/richtlijnen/mcp servers) from a cookbook into installable Claude Code plugins",
+    )
+    p.add_argument("--cookbook", help="path to the cookbook (default: walk up from cwd for cookbook.yaml)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pn = sub.add_parser("new-recipe", help="create a new recipe (picker) and blend it")
+    pn.add_argument("recipe")
+    pn.set_defaults(func=cmd_new_recipe)
+
+    pe = sub.add_parser("edit-recipe", help="edit an existing recipe (picker pre-checked) and re-blend it")
+    pe.add_argument("recipe")
+    pe.set_defaults(func=cmd_edit_recipe)
+
+    pb = sub.add_parser("blend", help="(re)build a blend from its recipe (no picker)")
+    pb.add_argument("recipe")
+    pb.set_defaults(func=cmd_blend)
+
+    pl = sub.add_parser("list", help="list all recipes")
+    pl.set_defaults(func=cmd_list)
+
+    pf = sub.add_parser("fetch", help="clone-if-missing + ff-only pull every store.yaml source, report stale blends")
+    pf.set_defaults(func=cmd_fetch)
+
+    pp = sub.add_parser("pour", help="install a blend into one or more drinkers (project folders)")
+    pp.add_argument("recipe")
+    pp.add_argument("drinkers", nargs="+", help="project folder(s) to pour into")
+    pp.add_argument("--scope", choices=["local", "project", "user"], default="local")
+    pp.set_defaults(func=cmd_pour)
+
+    pw = sub.add_parser("web", help="open the browser UI (new/edit recipes)")
+    pw.add_argument("--port", type=int, default=DEFAULT_PORT)
+    pw.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
+    pw.set_defaults(func=cmd_web)
+
+    args = p.parse_args()
+    global ROOT
+    ROOT = find_cookbook(args.cookbook)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
