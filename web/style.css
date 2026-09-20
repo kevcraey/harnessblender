@@ -9,7 +9,7 @@
   --accent-soft: #e8f0fe;
   --skill: #0e9f6e;
   --agent: #c2750a;
-  --richtlijn: #7c5cff;
+  --guideline: #7c5cff;
   --danger: #e5484d;
 }
 * { box-sizing: border-box; }
@@ -102,7 +102,7 @@ section.kind > h2 {
 }
 section.kind[data-kind=skill] > h2 span:first-child { color: var(--skill); }
 section.kind[data-kind=agent] > h2 span:first-child { color: var(--agent); }
-section.kind[data-kind=richtlijn] > h2 span:first-child { color: var(--richtlijn); }
+section.kind[data-kind=guideline] > h2 span:first-child { color: var(--guideline); }
 
 .group { margin: 3px 0 8px; }
 .group-head {

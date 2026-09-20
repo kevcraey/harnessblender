@@ -6,14 +6,14 @@
 #   "pyyaml>=6",
 # ]
 # ///
-"""harnessblender: blend ingredients (skills + agents + richtlijnen + mcp servers) from a
+"""harnessblender: blend ingredients (skills + agents + guidelines + mcp servers) from a
 cookbook into installable Claude Code plugins ("blends"), and pour them into projects.
 
 Terminology:
-  ingredients = pantry (your own skills/agents/richtlijnen/mcp-servers) + store
+  ingredients = pantry (your own skills/agents/guidelines/mcp-servers) + store
                 (external sources, declared in store.yaml, cloned into store/<name>/ — gitignored)
-  recipe      = a chosen selection of ingredients, saved in recipes/<naam>/recipe.yaml
-  blend       = build a recipe into recipes/<naam>/blend/: real copies (no symlinks) + plugin.json +
+  recipe      = a chosen selection of ingredients, saved in recipes/<name>/recipe.yaml
+  blend       = build a recipe into recipes/<name>/blend/: real copies (no symlinks) + plugin.json +
                 provenance, so a blend is self-contained and transferable
   cookbook    = the directory holding pantry/, store/, recipes/ — found by walking up from the
                 current directory for a `cookbook.yaml` marker file (or --cookbook)
@@ -40,24 +40,24 @@ import yaml
 TOOL_DIR = Path(__file__).resolve().parent
 ROOT: Path  # set by find_cookbook() at startup, once args are parsed
 
-# kind <-> plural mapping. richtlijn = los .md-bestand uit een `richtlijnen`-map.
-KIND_PLURAL = {"skill": "skills", "agent": "agents", "richtlijn": "richtlijnen", "mcp": "mcps", "plugin": "plugins"}
+# kind <-> plural mapping. guideline = a loose .md file from a `guidelines` directory.
+KIND_PLURAL = {"skill": "skills", "agent": "agents", "guideline": "guidelines", "mcp": "mcps", "plugin": "plugins"}
 PLURAL_KIND = {v: k for k, v in KIND_PLURAL.items()}
-PLURALS = ("skills", "agents", "richtlijnen", "mcps", "plugins")
-# Soorten die als kopie in de blend belanden. mcps niet: die worden in
-# plugin.json onder `mcpServers` samengevoegd (geen bestand om te kopiëren).
-# plugins niet: die zijn al een compleet zelfstandig plugin (eigen plugin.json) en worden
-# NOOIT in iets anders samengevoegd — verbatim gekopieerd naar recipes/<naam>/plugins/<as>/
-# en als eigen marketplace-entry geregistreerd. Zie rebuild_plugins().
-COPY_PLURALS = ("skills", "agents", "richtlijnen")
+PLURALS = ("skills", "agents", "guidelines", "mcps", "plugins")
+# Kinds that end up copied into the blend. Not mcps: those get merged into
+# plugin.json under `mcpServers` (no file to copy).
+# Not plugins: those are already a complete standalone plugin (own plugin.json) and are
+# NEVER merged into anything else — copied verbatim into recipes/<name>/plugins/<as>/
+# and registered as their own marketplace entry. See rebuild_plugins().
+COPY_PLURALS = ("skills", "agents", "guidelines")
 
-# Junk die nooit mee in een gekopieerde skill-map mag (bloat / niet-overdraagbaar).
+# Junk that must never end up in a copied skill directory (bloat / not portable).
 COPY_IGNORE = shutil.ignore_patterns(
     "__pycache__", "node_modules", ".git", ".venv", "venv", ".DS_Store", "*.pyc"
 )
 
-# Hook-bundel die in een blend beland zodra er richtlijnen geselecteerd zijn.
-# hooks/hooks.json wordt auto-ontdekt door Claude Code (geen plugin.json-veld nodig).
+# Hook bundle that ends up in a blend as soon as any guidelines are selected.
+# hooks/hooks.json is auto-discovered by Claude Code (no plugin.json field needed).
 HOOKS_JSON = {
     "hooks": {
         "SessionStart": [
@@ -66,7 +66,7 @@ HOOKS_JSON = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/link-richtlijnen.sh"',
+                        "command": 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/link-guidelines.sh"',
                     }
                 ],
             }
@@ -75,12 +75,12 @@ HOOKS_JSON = {
 }
 
 LINK_SCRIPT = """#!/usr/bin/env bash
-# Symlinkt de richtlijnen van deze plugin in het actieve project.
-# Geleverd door harnessblender; draait bij elke SessionStart. Idempotent.
-src="${CLAUDE_PLUGIN_ROOT}/richtlijnen"
-dst="${CLAUDE_PROJECT_DIR:-$PWD}/richtlijnen"
+# Symlinks this plugin's guidelines into the active project.
+# Shipped by harnessblender; runs on every SessionStart. Idempotent.
+src="${CLAUDE_PLUGIN_ROOT}/guidelines"
+dst="${CLAUDE_PROJECT_DIR:-$PWD}/guidelines"
 [ -d "$src" ] || exit 0
-# Niet clobberen als er al een ECHTE map staat (bv. nog-getrackte richtlijnen).
+# Don't clobber if a REAL directory is already there (e.g. still-tracked guidelines).
 if [ -e "$dst" ] && [ ! -L "$dst" ]; then
   exit 0
 fi
@@ -123,7 +123,7 @@ def load_store() -> list[dict]:
 
 
 def scan_roots() -> list[str]:
-    """Vaste scan-bases: pantry/ + elke store/<name>/. Geen configureerbare scan_bases meer."""
+    """Fixed scan bases: pantry/ + every store/<name>/. No more configurable scan_bases."""
     roots = ["pantry"]
     store_dir = ROOT / "store"
     if store_dir.is_dir():
@@ -134,26 +134,26 @@ def scan_roots() -> list[str]:
 
 @dataclass(frozen=True)
 class Item:
-    kind: str          # "skill" | "agent" | "richtlijn" | "mcp"
+    kind: str          # "skill" | "agent" | "guideline" | "mcp"
     root_label: str    # scan-root display (e.g. "pantry/skills" or "store/caveman/skills")
     name: str          # source basename (default plugin-side name)
     source: Path       # absolute path to source dir or file
 
 
 def default_as(it: Item) -> str:
-    """Default plugin-side naam. Een richtlijnen-README.md wordt als CLAUDE.md geladen."""
-    if it.kind == "richtlijn" and it.name == "README.md":
+    """Default plugin-side name. A guidelines README.md loads as CLAUDE.md."""
+    if it.kind == "guideline" and it.name == "README.md":
         return "CLAUDE.md"
     return it.name
 
 
 def default_as_for(kind: str, name: str) -> str:
-    if kind == "richtlijn" and name == "README.md":
+    if kind == "guideline" and name == "README.md":
         return "CLAUDE.md"
     return name
 
 
-# Mappen die we tijdens de walk nooit binnengaan.
+# Directories we never descend into during the walk.
 EXCLUDE_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv"}
 
 
@@ -167,16 +167,16 @@ def _collect_agents(d: Path, label: str, items: list[Item], seen: set[str]) -> N
             items.append(Item("agent", label, entry.name, entry))
 
 
-def _collect_richtlijnen(d: Path, label: str, items: list[Item], seen: set[str]) -> None:
+def _collect_guidelines(d: Path, label: str, items: list[Item], seen: set[str]) -> None:
     for entry in sorted(d.iterdir()):
         if entry.is_file() and entry.suffix == ".md" and str(entry) not in seen:
             seen.add(str(entry))
-            items.append(Item("richtlijn", label, entry.name, entry))
+            items.append(Item("guideline", label, entry.name, entry))
 
 
-# MCP-registry runtimeHint -> (command, prefix-args). Het registry-formaat (server.json)
-# beschrijft een pakket i.p.v. een kant-en-klare mcpServers-config; voor de simpele
-# gevallen (alleen identifier + runtimeHint) leiden we het launch-commando hieruit af.
+# MCP registry runtimeHint -> (command, prefix-args). The registry format (server.json)
+# describes a package rather than a ready-made mcpServers config; for the simple
+# cases (just identifier + runtimeHint) we derive the launch command from it.
 _REGISTRY_RUNNERS = {
     "npx": ("npx", ["-y"]),
     "uvx": ("uvx", []),
@@ -246,12 +246,14 @@ def _collect_mcps(d: Path, label: str, items: list[Item], seen: set[str]) -> Non
 
 
 def discover_sources(bases: list[str], exclude_dirs: list[str] | None = None) -> list[Item]:
-    """Walk `bases` (pantry/ + store/<name>/) en ontdek bronnen op conventie.
+    """Walk `bases` (pantry/ + store/<name>/) and discover sources by convention.
 
-    - map met SKILL.md           -> skill   (gegroepeerd onder z'n ouder-map)
-    - map genaamd `agents`       -> agents  (z'n .md / <naam>/<naam>.md entries)
-    - map genaamd `richtlijnen`  -> richtlijnen (z'n losse .md-bestanden)
-    - map genaamd `mcp-servers`  -> mcps    (submappen die mcpServers declareren)
+    - directory with SKILL.md         -> skill   (grouped under its parent directory)
+    - directory named `agents`        -> agents  (its .md / <name>/<name>.md entries)
+    - directory named `guidelines`    -> guidelines (its loose .md files; `richtlijnen` also
+                                         matches, as a legacy alias for external sources you
+                                         don't control)
+    - directory named `mcp-servers`   -> mcps    (subdirectories that declare mcpServers)
     """
     items: list[Item] = []
     seen: set[str] = set()
@@ -270,8 +272,8 @@ def discover_sources(bases: list[str], exclude_dirs: list[str] | None = None) ->
                 _collect_agents(d, relpath(d), items, seen)
                 dirnames[:] = []
                 continue
-            if d.name == "richtlijnen":
-                _collect_richtlijnen(d, relpath(d), items, seen)
+            if d.name in ("guidelines", "richtlijnen"):  # richtlijnen: legacy alias, for external sources you don't control
+                _collect_guidelines(d, relpath(d), items, seen)
                 dirnames[:] = []
                 continue
             if d.name == "mcp-servers":
@@ -282,7 +284,9 @@ def discover_sources(bases: list[str], exclude_dirs: list[str] | None = None) ->
                 if str(d) not in seen:
                     seen.add(str(d))
                     items.append(Item("plugin", relpath(d.parent), d.name, d))
-                dirnames[:] = []  # nooit in een plugin afdalen — die is al compleet
+                # keep walking: a plugin repo (e.g. an external one) can also contain
+                # individually-pickable skills/agents/guidelines/mcp-servers you want à la
+                # carte, alongside the option to pour it whole as its own plugin.
                 continue
             if (d / "SKILL.md").exists():
                 if str(d) not in seen:
@@ -321,7 +325,7 @@ def collect_preselected(current: dict) -> set[str]:
     return pre
 
 
-def build_choices(items: list[Item], preselected_abs: set[str], richtlijn_check_all: bool) -> list:
+def build_choices(items: list[Item], preselected_abs: set[str], guideline_check_all: bool) -> list:
     grouped: dict[str, list[Item]] = {}
     for it in items:
         grouped.setdefault(it.root_label, []).append(it)
@@ -331,7 +335,7 @@ def build_choices(items: list[Item], preselected_abs: set[str], richtlijn_check_
         choices.append(questionary.Separator(f"── {root_label} ──"))
         for it in sorted(grouped[root_label], key=lambda x: x.name):
             checked = str(it.source) in preselected_abs
-            if it.kind == "richtlijn" and richtlijn_check_all:
+            if it.kind == "guideline" and guideline_check_all:
                 checked = True
             choices.append(questionary.Choice(title=it.name, value=it, checked=checked))
     return choices
@@ -340,15 +344,15 @@ def build_choices(items: list[Item], preselected_abs: set[str], richtlijn_check_
 PICK_STEPS = [
     ("skill", "SKILLS"),
     ("agent", "AGENTS"),
-    ("richtlijn", "richtlijnen"),
+    ("guideline", "GUIDELINES"),
     ("mcp", "MCP SERVERS"),
-    ("plugin", "PLUGINS (zelfstandig, niet samengevoegd)"),
+    ("plugin", "PLUGINS (standalone, never merged)"),
 ]
 
 
 def run_picker(items: list[Item], current: dict) -> list[Item]:
     pre = collect_preselected(current)
-    richtlijn_check_all = "richtlijnen" not in (current.get("selections") or {})
+    guideline_check_all = "guidelines" not in (current.get("selections") or {})
     if not items:
         sys.exit("no ingredients found in pantry/ or store/.")
 
@@ -357,7 +361,7 @@ def run_picker(items: list[Item], current: dict) -> list[Item]:
         kind_items = [it for it in items if it.kind == kind]
         if not kind_items:
             continue
-        choices = build_choices(kind_items, pre, richtlijn_check_all)
+        choices = build_choices(kind_items, pre, guideline_check_all)
         result = questionary.checkbox(
             f"[{idx}/{len(PICK_STEPS)}] {label} (space toggle, enter confirm):",
             choices=choices,
@@ -470,9 +474,9 @@ def rebuild_items(blend: Path, mix: dict) -> None:
 
 
 def rebuild_plugins(name: str, mix: dict) -> None:
-    """Kopieer geselecteerde plugin-ingredients verbatim naar recipes/<naam>/plugins/<as>/.
-    Nooit in de blend samengevoegd — elk plugin-ingredient is al zelfstandig (eigen
-    plugin.json) en wordt in write_marketplace_json als eigen entry geregistreerd."""
+    """Copy selected plugin ingredients verbatim into recipes/<name>/plugins/<as>/.
+    Never merged into the blend — each plugin ingredient is already standalone (its own
+    plugin.json) and gets registered as its own entry in write_marketplace_json."""
     d = recipe_dir(name) / "plugins"
     clear_dir(d)
     entries = (mix.get("selections") or {}).get("plugins") or []
@@ -491,15 +495,15 @@ def rebuild_plugins(name: str, mix: dict) -> None:
 
 def write_hooks(blend: Path, mix: dict) -> bool:
     sels = mix.get("selections") or {}
-    has_richtlijnen = bool(sels.get("richtlijnen"))
+    has_guidelines = bool(sels.get("guidelines"))
     hooks_dir = blend / "hooks"
-    if not has_richtlijnen:
+    if not has_guidelines:
         if hooks_dir.exists():
             shutil.rmtree(hooks_dir)
         return False
     hooks_dir.mkdir(parents=True, exist_ok=True)
     (hooks_dir / "hooks.json").write_text(json.dumps(HOOKS_JSON, indent=2) + "\n")
-    script = hooks_dir / "link-richtlijnen.sh"
+    script = hooks_dir / "link-guidelines.sh"
     script.write_text(LINK_SCRIPT)
     script.chmod(0o755)
     return True
@@ -555,7 +559,7 @@ def write_marketplace_json(config: dict) -> None:
     for name in recipe_names():
         mix = read_recipe(name)
         c = counts(mix)
-        has_main_content = any(c[k] for k in ("skill", "agent", "richtlijn", "mcp"))
+        has_main_content = any(c[k] for k in ("skill", "agent", "guideline", "mcp"))
         if has_main_content:
             manifest = blend_dir(name) / ".claude-plugin" / "plugin.json"
             if manifest.exists():
@@ -563,8 +567,8 @@ def write_marketplace_json(config: dict) -> None:
                 register({"name": meta["name"], "description": meta.get("description", ""),
                           "source": f"./recipes/{name}/blend"})
 
-        # plugin-kind ingredients: al zelfstandig, elk zijn eigen marketplace-entry —
-        # nooit in de blend hierboven samengevoegd (zie rebuild_plugins()).
+        # plugin-kind ingredients: already standalone, each its own marketplace entry —
+        # never merged into the blend above (see rebuild_plugins()).
         plugins_dir = recipe_dir(name) / "plugins"
         if plugins_dir.is_dir():
             for p in sorted(plugins_dir.iterdir()):
@@ -577,8 +581,8 @@ def write_marketplace_json(config: dict) -> None:
     data = {
         "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
         "name": config.get("name") or ROOT.name,
-        "description": "Personal cookbook: blended skills + agents + richtlijnen + mcp servers",
-        "owner": config.get("owner") or {"name": "Kenzo"},
+        "description": "Personal cookbook: blended skills + agents + guidelines + mcp servers",
+        "owner": config.get("owner") or {"name": config.get("name") or ROOT.name},
         "plugins": plugins,
     }
     (market_dir / "marketplace.json").write_text(json.dumps(data, indent=2) + "\n")
@@ -661,9 +665,9 @@ def write_provenance(blend: Path, name: str, mix: dict) -> None:
     lines = [
         f"# Provenance — {name}",
         "",
-        "Auto-gegenereerd door harnessblender. Elk item is een **kopie** uit z'n bron op het",
-        f"getoonde commit. Wijzig aan de bron (pantry/ of store/) en draai `harnessblender blend "
-        f"{name}` om de kopie + deze provenance te verversen.",
+        "Auto-generated by harnessblender. Each item is a **copy** from its source at the",
+        f"shown commit. Change the source (pantry/ or store/) and run `harnessblender blend "
+        f"{name}` to refresh the copy + this provenance.",
         "",
     ]
     for kind, plural in KIND_PLURAL.items():
@@ -675,12 +679,12 @@ def write_provenance(blend: Path, name: str, mix: dict) -> None:
         lines.append(f"## {plural}")
         for it in sorted(group, key=lambda x: x["as"]):
             if not it.get("versioned"):
-                lines.append(f"- **{it['as']}** ← ⚠ niet onder versiebeheer (lokaal: `{it.get('local','?')}`)")
+                lines.append(f"- **{it['as']}** ← ⚠ not under version control (local: `{it.get('local','?')}`)")
                 continue
-            remote = it.get("remote") or "(geen origin-remote)"
+            remote = it.get("remote") or "(no origin remote)"
             commit = (it.get("commit") or "")[:12] or "?"
             if it.get("untracked"):
-                lines.append(f"- **{it['as']}** ← `{remote}` · `{it['path']}` ⚠ untracked (nog niet in commit `{commit}`)")
+                lines.append(f"- **{it['as']}** ← `{remote}` · `{it['path']}` ⚠ untracked (not yet in commit `{commit}`)")
                 continue
             dirty = " ⚠ dirty" if it.get("dirty") else ""
             lines.append(f"- **{it['as']}** ← `{remote}` · `{it['path']}` @ `{commit}`{dirty}")
@@ -706,8 +710,8 @@ def counts(mix: dict) -> dict[str, int]:
 
 def summary(mix: dict, has_hook: bool) -> str:
     c = counts(mix)
-    hk = " + richtlijnen-hook" if has_hook else ""
-    return f"skills={c['skill']} agents={c['agent']} richtlijnen={c['richtlijn']} mcps={c['mcp']}{hk}"
+    hk = " + guidelines-hook" if has_hook else ""
+    return f"skills={c['skill']} agents={c['agent']} guidelines={c['guideline']} mcps={c['mcp']}{hk}"
 
 
 PANTRY_README = """# pantry/
@@ -716,9 +720,10 @@ Your own ingredients. Discovery works by convention, walked recursively from her
 each `store/<name>/`):
 
 - **skill**    — any directory containing `SKILL.md`, at any depth, any parent folder name.
-- **agent**    — a directory literally named `agents`; its direct `.md` files (or `<naam>/<naam>.md`) become agents.
-- **richtlijn**— a directory literally named `richtlijnen`; its direct `.md` files become richtlijnen
-                 (a `README.md` there installs as `CLAUDE.md`).
+- **agent**    — a directory literally named `agents`; its direct `.md` files (or `<name>/<name>.md`) become agents.
+- **guideline**— a directory literally named `guidelines` (or `richtlijnen`, kept as a legacy
+                 alias for external sources you don't control); its direct `.md` files become
+                 guidelines (a `README.md` there installs as `CLAUDE.md`).
 - **mcp**      — a directory literally named `mcp-servers`; each immediate subdirectory that declares
                  `mcpServers` via `.mcp.json`, `.claude-plugin/.mcp.json`, `.claude-plugin/plugin.json`
                  or `server.json` becomes one mcp ingredient.
@@ -727,7 +732,7 @@ each `store/<name>/`):
                  `plugins/` folder name here is just a suggested landing spot, not a discovery trigger.
 
 `skills/` and `plugins/` are suggested groupings, not required names — put a skill anywhere as
-long as it has a `SKILL.md`. `agents/`, `richtlijnen/` and `mcp-servers/` ARE required names:
+long as it has a `SKILL.md`. `agents/`, `guidelines/` and `mcp-servers/` ARE required names:
 discovery only fires on that exact directory name.
 """
 
@@ -762,7 +767,7 @@ def cmd_init(args) -> None:
     )
     (target / "pantry").mkdir()
     (target / "pantry" / "README.md").write_text(PANTRY_README)
-    for sub in ("skills", "agents", "richtlijnen", "mcp-servers", "plugins"):
+    for sub in ("skills", "agents", "guidelines", "mcp-servers", "plugins"):
         d = target / "pantry" / sub
         d.mkdir()
         (d / ".gitkeep").touch()
@@ -777,12 +782,12 @@ def cmd_init(args) -> None:
         "store/*\n"
         "!store/.gitkeep\n"
         "\n"
-        "# recipes/<naam>/blend/: generated output per recipe, regenerable via `harnessblender blend`.\n"
+        "# recipes/<name>/blend/: generated output per recipe, regenerable via `harnessblender blend`.\n"
         "recipes/*/blend/\n"
     )
     print(f"cookbook created: {target}")
     print("next: drop ingredients under pantry/ (see pantry/README.md), add store.yaml sources,")
-    print(f"then: harnessblender --cookbook {target} new-recipe <naam>")
+    print(f"then: harnessblender --cookbook {target} new-recipe <name>")
 
 
 def cmd_new_recipe(args) -> None:
@@ -838,10 +843,10 @@ def cmd_list(args) -> None:
     for name in names:
         mix = read_recipe(name)
         c = counts(mix)
-        hook = "hook" if c["richtlijn"] else "    "
+        hook = "hook" if c["guideline"] else "    "
         blended = "blended" if blend_dir(name).exists() else "not blended"
         desc = mix.get("description", "")
-        print(f"  {name:20s}  s={c['skill']:<3d} a={c['agent']:<3d} r={c['richtlijn']:<3d} "
+        print(f"  {name:20s}  s={c['skill']:<3d} a={c['agent']:<3d} r={c['guideline']:<3d} "
               f"m={c['mcp']:<3d} {hook}  [{blended}]  {desc}")
 
 
@@ -972,15 +977,15 @@ def cmd_fetch(args) -> None:
 # ── pour: install a blend into a project via the Claude Code CLI ───────────
 
 def pour_targets(recipe: str) -> list[str]:
-    """Install-ids voor een recipe: de hoofd-blend (als die skills/agents/richtlijnen/mcps
-    heeft) + elk plugin-ingredient apart (eigen naam uit zijn eigen plugin.json — nooit
-    samengevoegd, zie rebuild_plugins())."""
+    """Install ids for a recipe: the main blend (if it has skills/agents/guidelines/mcps)
+    plus each plugin ingredient separately (its own name from its own plugin.json — never
+    merged, see rebuild_plugins())."""
     if not blend_dir(recipe).exists():
         sys.exit(f"recipe '{recipe}' has not been blended yet — run `harnessblender blend {recipe}` first.")
     mix = read_recipe(recipe)
     c = counts(mix)
     ids: list[str] = []
-    if any(c[k] for k in ("skill", "agent", "richtlijn", "mcp")):
+    if any(c[k] for k in ("skill", "agent", "guideline", "mcp")):
         ids.append(recipe)
     plugins_dir = recipe_dir(recipe) / "plugins"
     if plugins_dir.is_dir():
@@ -1026,8 +1031,8 @@ CONTENT_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/c
 
 
 def list_variants() -> list[dict]:
-    """Alle recipes + hun huidige selectie (source-relpaths) voor de web-UI.
-    (Veldnamen blijven `variant`/`variants` — dat is het JSON-contract dat app.js verwacht.)"""
+    """All recipes + their current selection (source relpaths) for the web UI.
+    (Field names stay `variant`/`variants` — that's the JSON contract app.js expects.)"""
     out: list[dict] = []
     for name in recipe_names():
         mix = read_recipe(name)
@@ -1056,13 +1061,14 @@ def web_state(items: list[Item], config: dict) -> dict:
 
 
 def write_config(data: dict) -> None:
-    """Herschrijft cookbook.yaml (behoudt name/owner/exclude_dirs mét commentaar)."""
-    owner = data.get("owner") or {"name": "Kenzo", "url": ""}
+    """Rewrites cookbook.yaml (keeps name/owner/exclude_dirs, with comments)."""
+    name = data.get("name") or ROOT.name
+    owner = data.get("owner") or {"name": name, "url": ""}
     lines = [
         "# harnessblender-cookbook marker file.",
-        f"name: {data.get('name') or ROOT.name}",
+        f"name: {name}",
         "owner:",
-        f"  name: {owner.get('name', 'Kenzo')}",
+        f"  name: {owner.get('name', name)}",
         f'  url: "{owner.get("url", "")}"',
         "",
         "exclude_dirs:",
@@ -1072,7 +1078,7 @@ def write_config(data: dict) -> None:
 
 
 def save_variant(config: dict, items: list[Item], payload: dict) -> dict:
-    """Schrijf/overschrijf + blend een recipe vanuit een web-payload. Raise ValueError op fout."""
+    """Write/overwrite + blend a recipe from a web payload. Raises ValueError on failure."""
     name = (payload.get("variant") or "").strip()
     if not name or name.startswith(".") or "/" in name or os.sep in name:
         raise ValueError("invalid recipe name")
@@ -1178,7 +1184,7 @@ def cmd_web(args) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="harnessblender",
-        description="blend ingredients (skills/agents/richtlijnen/mcp servers) from a cookbook into installable Claude Code plugins",
+        description="blend ingredients (skills/agents/guidelines/mcp servers) from a cookbook into installable Claude Code plugins",
     )
     p.add_argument("--cookbook", help="path to the cookbook (default: walk up from cwd for cookbook.yaml)")
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -3,7 +3,7 @@
 const KINDS = [
   { kind: "skill", label: "Skills" },
   { kind: "agent", label: "Agents" },
-  { kind: "richtlijn", label: "Richtlijnen" },
+  { kind: "guideline", label: "Guidelines" },
   { kind: "mcp", label: "MCP Servers" },
 ];
 
@@ -31,7 +31,7 @@ function renderBlacklist() {
   box.replaceChildren();
   for (const name of STATE.exclude_dirs || []) {
     const chip = el("span", { className: "chip", textContent: name });
-    const x = el("button", { className: "x", textContent: "×", title: "verwijderen" });
+    const x = el("button", { className: "x", textContent: "×", title: "remove" });
     x.onclick = () => saveBlacklist((STATE.exclude_dirs || []).filter((n) => n !== name));
     chip.append(x);
     box.append(chip);
@@ -45,7 +45,7 @@ async function saveBlacklist(list) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ exclude_dirs: list }),
   })).json();
-  // selectie/context behouden over de re-scan heen
+  // keep selection/context across the re-scan
   ctx = { name: prevName, isNew: prevNew, selected: prevSel };
   renderSidebar();
   renderBlacklist();
@@ -53,9 +53,9 @@ async function saveBlacklist(list) {
 }
 
 function startNew() {
-  // nieuwe variant: richtlijnen standaard aan
+  // new variant: guidelines on by default
   const pre = new Set(
-    STATE.items.filter((i) => i.kind === "richtlijn").map((i) => i.source)
+    STATE.items.filter((i) => i.kind === "guideline").map((i) => i.source)
   );
   ctx = { name: "", isNew: true, selected: pre };
   renderSidebar();
@@ -78,7 +78,7 @@ function renderSidebar() {
       el("div", { className: "vname", textContent: v.name }),
       el("div", {
         className: "vmeta",
-        textContent: `s${v.counts.skill} · a${v.counts.agent} · r${v.counts.richtlijn} · m${v.counts.mcp || 0}${v.counts.richtlijn ? " · hook" : ""}`,
+        textContent: `s${v.counts.skill} · a${v.counts.agent} · r${v.counts.guideline} · m${v.counts.mcp || 0}${v.counts.guideline ? " · hook" : ""}`,
       }),
     ]);
     btn.onclick = () => openVariant(v);
@@ -106,7 +106,7 @@ function renderMain() {
       el("span", { className: "kcount", textContent: "" }),
     ]));
 
-    // groepeer per root_label
+    // group by root_label
     const groups = new Map();
     for (const it of items) {
       if (!groups.has(it.root_label)) groups.set(it.root_label, []);
@@ -122,7 +122,7 @@ function renderMain() {
 
 function renderGroup(label, items) {
   const wrap = el("div", { className: "group" });
-  const toggleAll = el("span", { className: "ga", textContent: "alles" });
+  const toggleAll = el("span", { className: "ga", textContent: "all" });
   const head = el("div", { className: "group-head" }, [
     el("span", { className: "label", textContent: label }),
     toggleAll,
@@ -161,13 +161,13 @@ function renderGroup(label, items) {
 function updateCounts() {
   const byKind = (k) =>
     STATE.items.filter((i) => i.kind === k && ctx.selected.has(i.source)).length;
-  const s = byKind("skill"), a = byKind("agent"), r = byKind("richtlijn"), m = byKind("mcp");
+  const s = byKind("skill"), a = byKind("agent"), r = byKind("guideline"), m = byKind("mcp");
   $("#counts").innerHTML =
-    `<b>${s}</b> skills · <b>${a}</b> agents · <b>${r}</b> richtlijnen · <b>${m}</b> mcp` +
+    `<b>${s}</b> skills · <b>${a}</b> agents · <b>${r}</b> guidelines · <b>${m}</b> mcp` +
     (r ? " <b>+hook</b>" : "");
   for (const sec of document.querySelectorAll("section.kind")) {
     const k = sec.dataset.kind;
-    sec.querySelector(".kcount").textContent = `${byKind(k)} gekozen`;
+    sec.querySelector(".kcount").textContent = `${byKind(k)} selected`;
   }
 }
 
@@ -181,10 +181,10 @@ function toast(msg, kind) {
 
 async function save() {
   const name = $("#variant-name").value.trim();
-  if (!name) return toast("naam verplicht", "err");
+  if (!name) return toast("name required", "err");
   const btn = $("#save-btn");
   btn.disabled = true;
-  $("#status").textContent = "opslaan…";
+  $("#status").textContent = "saving…";
   try {
     const res = await fetch("/api/save", {
       method: "POST",
@@ -197,9 +197,9 @@ async function save() {
       }),
     });
     const data = await res.json();
-    if (!res.ok) { toast(data.error || "fout", "err"); return; }
+    if (!res.ok) { toast(data.error || "error", "err"); return; }
     const c = data.counts;
-    toast(`'${name}' opgeslagen — skills=${c.skill} agents=${c.agent} richtlijnen=${c.richtlijn} mcp=${c.mcp}${data.hook ? " +hook" : ""}`, "ok");
+    toast(`'${name}' saved — skills=${c.skill} agents=${c.agent} guidelines=${c.guideline} mcp=${c.mcp}${data.hook ? " +hook" : ""}`, "ok");
     ctx.isNew = false; ctx.name = name;
     await load();
   } catch (e) {

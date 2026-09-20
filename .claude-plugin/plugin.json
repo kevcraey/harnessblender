@@ -1,0 +1,5 @@
+{
+  "name": "harnessblender",
+  "description": "Blend chosen ingredients (skills, agents, guidelines, mcp servers, plugins) from a cookbook into installable Claude Code plugins, and pour them into projects.",
+  "version": "0.1.0"
+}

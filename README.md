@@ -1,12 +1,22 @@
 # harnessblender
 
-Blend ingredients (skills, agents, richtlijnen, mcp servers) from a **cookbook** into installable
+Blend ingredients (skills, agents, guidelines, mcp servers) from a **cookbook** into installable
 Claude Code plugins ("blends"), and pour them into projects. harnessblender itself is generic and
 carries no personal content — everything specific lives in a separate cookbook repo.
 
 Terminology: **ingredients** (pantry = your own, store = external, fetched) → **recipe** (a chosen
 selection) → **blend** (the built plugin) → **pour** (install it into a **drinker**, a project
 folder).
+
+## Install the skill (no cookbook needed)
+
+This repo bundles a Claude Code plugin with one skill — everything above, explained to Claude —
+so it's usable before you've even created a cookbook:
+
+```bash
+claude plugin marketplace add /path/to/harnessblender
+claude plugin install harnessblender@harnessblender --scope user -y
+```
 
 ## Requirements
 
@@ -19,12 +29,12 @@ folder).
 
 ```bash
 ./harnessblender init <path>                # scaffold a new, empty cookbook
-./harnessblender new-recipe <naam>          # picker → recipe.yaml → blend
-./harnessblender edit-recipe <naam>         # picker, pre-checked → re-blend
-./harnessblender blend <naam>               # rebuild blend/ from recipe.yaml, no picker
+./harnessblender new-recipe <name>          # picker → recipe.yaml → blend
+./harnessblender edit-recipe <name>         # picker, pre-checked → re-blend
+./harnessblender blend <name>               # rebuild blend/ from recipe.yaml, no picker
 ./harnessblender list                       # all recipes + blended status
 ./harnessblender fetch                      # clone-if-missing + ff-only pull every store.yaml source
-./harnessblender pour <naam> <drinker...>   # install a blend into project folder(s)
+./harnessblender pour <name> <drinker...>   # install a blend into project folder(s)
 ./harnessblender web                        # browser picker
 ```
 
@@ -42,11 +52,13 @@ my-cookbook/
 ├── pantry/                # your own ingredients — see pantry/README.md after `init`
 │   ├── skills/            #   any dir with SKILL.md, anywhere — "skills/" is just a convention
 │   ├── agents/            #   REQUIRED name — direct .md files become agents
-│   ├── richtlijnen/       #   REQUIRED name — direct .md files become richtlijnen (README.md → CLAUDE.md)
+│   ├── guidelines/        #   REQUIRED name (`richtlijnen` also matches, as a legacy alias for
+│   │                      #   external sources you don't control) — direct .md files become
+│   │                      #   guidelines (README.md → CLAUDE.md)
 │   ├── mcp-servers/       #   REQUIRED name — subdirs declaring mcpServers become mcp ingredients
 │   └── plugins/           #   convention only — a plugin is any dir with .claude-plugin/plugin.json
 └── recipes/
-    └── <naam>/
+    └── <name>/
         ├── recipe.yaml    # tracked: description, version, selections
         └── blend/         # gitignored: generated output of `blend`/`pour` — real copies, no symlinks
 ```
@@ -73,7 +85,7 @@ sources:
     url: git@github.com:someone/some-skill-repo.git
 ```
 
-### `recipes/<naam>/recipe.yaml`
+### `recipes/<name>/recipe.yaml`
 
 ```yaml
 description: "what this recipe is for"
@@ -83,7 +95,7 @@ selections:
     - source: pantry/skills/writing/my-skill
       as: my-skill
   agents: []
-  richtlijnen: []
+  guidelines: []
   mcps: []
   plugins:
     - source: pantry/plugins/quiet

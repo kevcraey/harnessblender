@@ -1,34 +1,34 @@
 <!doctype html>
-<html lang="nl">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>mix-plugin</title>
+  <title>harnessblender</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
   <aside id="sidebar">
-    <h1>mix-plugin</h1>
-    <button id="new-btn" class="variant new">+ nieuwe variant</button>
+    <h1>harnessblender</h1>
+    <button id="new-btn" class="variant new">+ new variant</button>
     <ul id="variant-list"></ul>
 
     <section id="blacklist">
-      <h2>uitgesloten mappen</h2>
+      <h2>excluded directories</h2>
       <div id="bl-chips"></div>
-      <input id="bl-input" type="text" placeholder="map-naam + enter" autocomplete="off" />
+      <input id="bl-input" type="text" placeholder="directory name + enter" autocomplete="off" />
     </section>
   </aside>
 
   <main id="main">
     <header id="head">
       <div class="row">
-        <label>naam
+        <label>name
           <input id="variant-name" type="text" placeholder="my-variant" autocomplete="off" />
         </label>
         <span id="counts" class="counts"></span>
       </div>
-      <label class="desc">beschrijving
-        <input id="variant-desc" type="text" placeholder="korte beschrijving" autocomplete="off" />
+      <label class="desc">description
+        <input id="variant-desc" type="text" placeholder="short description" autocomplete="off" />
       </label>
     </header>
 
@@ -36,7 +36,7 @@
 
     <footer id="foot">
       <span id="status"></span>
-      <button id="save-btn">opslaan</button>
+      <button id="save-btn">save</button>
     </footer>
   </main>
 
