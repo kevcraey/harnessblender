@@ -41,11 +41,14 @@ TOOL_DIR = Path(__file__).resolve().parent
 ROOT: Path  # set by find_cookbook() at startup, once args are parsed
 
 # kind <-> plural mapping. richtlijn = los .md-bestand uit een `richtlijnen`-map.
-KIND_PLURAL = {"skill": "skills", "agent": "agents", "richtlijn": "richtlijnen", "mcp": "mcps"}
+KIND_PLURAL = {"skill": "skills", "agent": "agents", "richtlijn": "richtlijnen", "mcp": "mcps", "plugin": "plugins"}
 PLURAL_KIND = {v: k for k, v in KIND_PLURAL.items()}
-PLURALS = ("skills", "agents", "richtlijnen", "mcps")
+PLURALS = ("skills", "agents", "richtlijnen", "mcps", "plugins")
 # Soorten die als kopie in de blend belanden. mcps niet: die worden in
 # plugin.json onder `mcpServers` samengevoegd (geen bestand om te kopiëren).
+# plugins niet: die zijn al een compleet zelfstandig plugin (eigen plugin.json) en worden
+# NOOIT in iets anders samengevoegd — verbatim gekopieerd naar recipes/<naam>/plugins/<as>/
+# en als eigen marketplace-entry geregistreerd. Zie rebuild_plugins().
 COPY_PLURALS = ("skills", "agents", "richtlijnen")
 
 # Junk die nooit mee in een gekopieerde skill-map mag (bloat / niet-overdraagbaar).
@@ -275,6 +278,12 @@ def discover_sources(bases: list[str], exclude_dirs: list[str] | None = None) ->
                 _collect_mcps(d, relpath(d), items, seen)
                 dirnames[:] = []
                 continue
+            if (d / ".claude-plugin" / "plugin.json").exists():
+                if str(d) not in seen:
+                    seen.add(str(d))
+                    items.append(Item("plugin", relpath(d.parent), d.name, d))
+                dirnames[:] = []  # nooit in een plugin afdalen — die is al compleet
+                continue
             if (d / "SKILL.md").exists():
                 if str(d) not in seen:
                     seen.add(str(d))
@@ -333,6 +342,7 @@ PICK_STEPS = [
     ("agent", "AGENTS"),
     ("richtlijn", "richtlijnen"),
     ("mcp", "MCP SERVERS"),
+    ("plugin", "PLUGINS (zelfstandig, niet samengevoegd)"),
 ]
 
 
@@ -459,6 +469,26 @@ def rebuild_items(blend: Path, mix: dict) -> None:
                 shutil.copy2(src, target)
 
 
+def rebuild_plugins(name: str, mix: dict) -> None:
+    """Kopieer geselecteerde plugin-ingredients verbatim naar recipes/<naam>/plugins/<as>/.
+    Nooit in de blend samengevoegd — elk plugin-ingredient is al zelfstandig (eigen
+    plugin.json) en wordt in write_marketplace_json als eigen entry geregistreerd."""
+    d = recipe_dir(name) / "plugins"
+    clear_dir(d)
+    entries = (mix.get("selections") or {}).get("plugins") or []
+    if not entries:
+        if d.exists():
+            shutil.rmtree(d)
+        return
+    d.mkdir(parents=True, exist_ok=True)
+    for sel in entries:
+        src = (ROOT / sel["source"]).resolve()
+        if not src.exists():
+            print(f"warn: source missing, skipping: {sel['source']}", file=sys.stderr)
+            continue
+        shutil.copytree(src, d / sel["as"], symlinks=False, ignore=COPY_IGNORE)
+
+
 def write_hooks(blend: Path, mix: dict) -> bool:
     sels = mix.get("selections") or {}
     has_richtlijnen = bool(sels.get("richtlijnen"))
@@ -512,16 +542,38 @@ def write_marketplace_json(config: dict) -> None:
     market_dir = ROOT / ".claude-plugin"
     market_dir.mkdir(parents=True, exist_ok=True)
     plugins = []
+    seen_names: set[str] = set()
+
+    def register(entry: dict) -> None:
+        if entry["name"] in seen_names:
+            print(f"warn: duplicate plugin name '{entry['name']}' in marketplace — keeping first "
+                  f"(source: {entry['source']})", file=sys.stderr)
+            return
+        seen_names.add(entry["name"])
+        plugins.append(entry)
+
     for name in recipe_names():
-        manifest = blend_dir(name) / ".claude-plugin" / "plugin.json"
-        if not manifest.exists():
-            continue
-        meta = json.loads(manifest.read_text())
-        plugins.append({
-            "name": meta["name"],
-            "description": meta.get("description", ""),
-            "source": f"./recipes/{name}/blend",
-        })
+        mix = read_recipe(name)
+        c = counts(mix)
+        has_main_content = any(c[k] for k in ("skill", "agent", "richtlijn", "mcp"))
+        if has_main_content:
+            manifest = blend_dir(name) / ".claude-plugin" / "plugin.json"
+            if manifest.exists():
+                meta = json.loads(manifest.read_text())
+                register({"name": meta["name"], "description": meta.get("description", ""),
+                          "source": f"./recipes/{name}/blend"})
+
+        # plugin-kind ingredients: al zelfstandig, elk zijn eigen marketplace-entry —
+        # nooit in de blend hierboven samengevoegd (zie rebuild_plugins()).
+        plugins_dir = recipe_dir(name) / "plugins"
+        if plugins_dir.is_dir():
+            for p in sorted(plugins_dir.iterdir()):
+                manifest = p / ".claude-plugin" / "plugin.json"
+                if not manifest.exists():
+                    continue
+                meta = json.loads(manifest.read_text())
+                register({"name": meta["name"], "description": meta.get("description", ""),
+                          "source": f"./recipes/{name}/plugins/{p.name}"})
     data = {
         "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
         "name": config.get("name") or ROOT.name,
@@ -641,6 +693,7 @@ def apply(name: str, mix: dict, config: dict) -> bool:
     rebuild_items(blend, mix)
     has_hook = write_hooks(blend, mix)
     write_plugin_json(blend, name, mix)
+    rebuild_plugins(name, mix)
     write_provenance(blend, name, mix)
     write_marketplace_json(config)
     return has_hook
@@ -843,29 +896,51 @@ def cmd_fetch(args) -> None:
 
 # ── pour: install a blend into a project via the Claude Code CLI ───────────
 
+def pour_targets(recipe: str) -> list[str]:
+    """Install-ids voor een recipe: de hoofd-blend (als die skills/agents/richtlijnen/mcps
+    heeft) + elk plugin-ingredient apart (eigen naam uit zijn eigen plugin.json — nooit
+    samengevoegd, zie rebuild_plugins())."""
+    if not blend_dir(recipe).exists():
+        sys.exit(f"recipe '{recipe}' has not been blended yet — run `harnessblender blend {recipe}` first.")
+    mix = read_recipe(recipe)
+    c = counts(mix)
+    ids: list[str] = []
+    if any(c[k] for k in ("skill", "agent", "richtlijn", "mcp")):
+        ids.append(recipe)
+    plugins_dir = recipe_dir(recipe) / "plugins"
+    if plugins_dir.is_dir():
+        for p in sorted(plugins_dir.iterdir()):
+            manifest = p / ".claude-plugin" / "plugin.json"
+            if manifest.exists():
+                ids.append(json.loads(manifest.read_text())["name"])
+    if not ids:
+        sys.exit(f"recipe '{recipe}' has nothing to pour (empty selections).")
+    return ids
+
+
 def cmd_pour(args) -> None:
     config = load_config()
-    name = config.get("name") or ROOT.name
-    if not blend_dir(args.recipe).exists():
-        sys.exit(f"recipe '{args.recipe}' has not been blended yet — run `harnessblender blend {args.recipe}` first.")
+    market = config.get("name") or ROOT.name
+    ids = pour_targets(args.recipe)
 
     for drinker in args.drinkers:
         target = Path(drinker).expanduser().resolve()
         if not target.is_dir():
             print(f"skip {drinker}: not a directory", file=sys.stderr)
             continue
-        print(f"== pouring '{args.recipe}' into {target} (scope={args.scope}) ==")
+        print(f"== pouring '{args.recipe}' ({', '.join(ids)}) into {target} (scope={args.scope}) ==")
         add = subprocess.run(["claude", "plugin", "marketplace", "add", str(ROOT)],
                              cwd=target, capture_output=True, text=True)
         if add.returncode != 0:
             print(f"  marketplace add: {add.stdout.strip() or add.stderr.strip()} (continuing — likely already added)")
-        install = subprocess.run(
-            ["claude", "plugin", "install", f"{args.recipe}@{name}", "--scope", args.scope, "-y"],
-            cwd=target, capture_output=True, text=True)
-        if install.returncode != 0:
-            print(f"  ERROR: {install.stdout.strip() or install.stderr.strip()}", file=sys.stderr)
-        else:
-            print(f"  {install.stdout.strip() or 'poured.'}")
+        for plugin_id in ids:
+            install = subprocess.run(
+                ["claude", "plugin", "install", f"{plugin_id}@{market}", "--scope", args.scope, "-y"],
+                cwd=target, capture_output=True, text=True)
+            if install.returncode != 0:
+                print(f"  ERROR ({plugin_id}): {install.stdout.strip() or install.stderr.strip()}", file=sys.stderr)
+            else:
+                print(f"  {plugin_id}: {install.stdout.strip() or 'poured.'}")
 
 
 # ── web UI (stdlib only) ─────────────────────────────────────────────────────
