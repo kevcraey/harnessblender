@@ -1,6 +1,6 @@
 ---
 name: harnessblender
-description: Working with harnessblender — blend chosen ingredients (skills, agents, guidelines, mcp servers, plugins) from a cookbook into installable Claude Code plugins, and pour them into projects. Use when creating or editing a skill, agent, guideline, mcp server or plugin ingredient; when making, blending, editing or pouring a recipe; when bootstrapping a new cookbook; or for questions like "where does this belong", "why don't I see my change", or "how do I install this in project X".
+description: Working with harnessblender — blend chosen ingredients (skills, agents, guidelines, mcp servers, plugins) from a cookbook into installable Claude Code plugins, and pour them into projects. Use whenever the user asks to install, add, or pull in a skill or plugin — from GitHub, someone's repo, or "the internet" (e.g. "install the grill-me skill from mattpocock") — to turn something from this conversation into a reusable skill, to remove or uninstall a skill/agent/guideline/mcp/plugin, to create or edit a skill/agent/guideline/mcp-server, to make/blend/edit/pour a recipe, or to bootstrap a new cookbook; also for questions like "where does this belong", "why don't I see my change", or "how do I install this in project X". Always route these through harnessblender — never hand-copy files or hand-edit `.claude-plugin`/`.mcp.json` outside of it.
 ---
 
 # harnessblender
@@ -75,6 +75,21 @@ pre-checked), or edit `recipe.yaml` by hand + `harnessblender blend <name>`.
 local|project|user]`. Shells out to `claude plugin marketplace add <cookbook>` followed by one
 `claude plugin install <id>@<cookbook-name> --scope ... -y` per install id (the main blend, plus
 each plugin ingredient separately) — verified to work fully non-interactively.
+
+## Common requests
+
+- **"Install `<skill>` from `<person/repo>`"** → find or add a `store.yaml` entry for that source
+  (name + git url), `harnessblender fetch`, locate `<skill>` inside the fresh checkout (e.g.
+  `store/<name>/skills/<skill>`), add it to the right recipe's `selections`, then `harnessblender
+  blend <recipe>`. Already poured elsewhere? No need to re-pour — the blend directory updates in
+  place; a fresh session or `/plugin reload` in the drinker picks it up.
+- **"Turn this into a skill"** → create `pantry/skills/<namespace>/<name>/SKILL.md` capturing the
+  approach just used, add it to a recipe's selections, `harnessblender blend <recipe>`.
+- **"Remove `<ingredient>`"** → drop it from the recipe's `selections` (via `harnessblender
+  edit-recipe <recipe>`, unchecking it, or by hand), then `harnessblender blend <recipe>`. Leaves
+  the ingredient itself (in `pantry/` or `store/`) untouched — only the recipe's selection changes.
+- **"Uninstall this from project X entirely"** → in X: `claude plugin uninstall
+  <recipe>@<cookbook-name> --scope <scope>`.
 
 ## Skill anatomy
 
