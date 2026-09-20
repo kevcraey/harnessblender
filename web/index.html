@@ -7,38 +7,27 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <aside id="sidebar">
+  <header id="topbar">
     <h1>harnessblender</h1>
-    <button id="new-btn" class="variant new">+ new variant</button>
-    <ul id="variant-list"></ul>
-
-    <section id="blacklist">
-      <h2>excluded directories</h2>
+    <nav id="tabs">
+      <button class="tab active" data-tab="recipes" type="button">Recipes</button>
+      <button class="tab" data-tab="drinkers" type="button">Drinkers</button>
+    </nav>
+    <input id="filter" type="text" placeholder="filter ingredients…" autocomplete="off" />
+    <div id="blacklist" class="chipgroup">
+      <span class="tlabel">exclude</span>
       <div id="bl-chips"></div>
-      <input id="bl-input" type="text" placeholder="directory name + enter" autocomplete="off" />
-    </section>
-  </aside>
+      <input id="bl-input" type="text" placeholder="dir + enter" autocomplete="off" />
+    </div>
+  </header>
 
-  <main id="main">
-    <header id="head">
-      <div class="row">
-        <label>name
-          <input id="variant-name" type="text" placeholder="my-variant" autocomplete="off" />
-        </label>
-        <span id="counts" class="counts"></span>
-      </div>
-      <label class="desc">description
-        <input id="variant-desc" type="text" placeholder="short description" autocomplete="off" />
-      </label>
-    </header>
+  <div id="table-wrap">
+    <table id="matrix"></table>
+  </div>
 
-    <div id="sections"></div>
-
-    <footer id="foot">
-      <span id="status"></span>
-      <button id="save-btn">save</button>
-    </footer>
-  </main>
+  <div id="drinkers-view" class="hidden">
+    <div id="drinkers-cards"></div>
+  </div>
 
   <div id="toast" class="hidden"></div>
   <script src="/app.js"></script>

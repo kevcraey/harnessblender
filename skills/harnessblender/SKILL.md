@@ -60,6 +60,12 @@ absolute path, so not portable to another machine without reprovisioning.
 `harnessblender fetch` (clones if not already present). Reference the path inside that checkout
 from a recipe, e.g. `store/caveman/skills/caveman`. Never edit inside `store/` directly.
 
+**Drop an external source entirely** → `harnessblender remove-store <name>`. Removes the
+`store.yaml` entry, deletes `store/<name>/`, and scrubs it from every recipe's selections
+(re-blending affected recipes). There's no per-item removal inside a store checkout — dropping
+the whole source is the only supported way; deleting one file inside it would just leave that
+checkout dirty and permanently un-refreshable by `fetch`.
+
 **A standalone plugin you already have** (own `.claude-plugin/plugin.json`) → drop it anywhere
 under `pantry/` or `store/<name>/` (commonly `pantry/plugins/<name>/`). Never merged into a blend:
 copied verbatim and registered as its own marketplace entry — avoids all naming/collision risk
@@ -71,6 +77,9 @@ by hand, then `harnessblender blend <name>`.
 **Edit an existing recipe** → `harnessblender edit-recipe <name>` (picker, current selection
 pre-checked), or edit `recipe.yaml` by hand + `harnessblender blend <name>`.
 
+**Delete a recipe** → `harnessblender delete-recipe <name>`. Only removes the recipe itself
+(`recipe.yaml` + `blend/`) — never touches drinkers it's already poured into.
+
 **Install into a project (pour)** → `harnessblender pour <recipe> <drinker-path...> [--scope
 local|project|user]`. Shells out to `claude plugin marketplace add <cookbook>` followed by one
 `claude plugin install <id>@<cookbook-name> --scope ... -y` per install id (the main blend, plus
@@ -81,8 +90,12 @@ each plugin ingredient separately) — verified to work fully non-interactively.
 - **"Install `<skill>` from `<person/repo>`"** → find or add a `store.yaml` entry for that source
   (name + git url), `harnessblender fetch`, locate `<skill>` inside the fresh checkout (e.g.
   `store/<name>/skills/<skill>`), add it to the right recipe's `selections`, then `harnessblender
-  blend <recipe>`. Already poured elsewhere? No need to re-pour — the blend directory updates in
-  place; a fresh session or `/plugin reload` in the drinker picks it up.
+  blend <recipe>`. Already poured elsewhere? Claude Code caches an installed plugin's content
+  per **version** (`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`) — re-blending
+  alone does NOT refresh an already-poured drinker. Bump `version:` in the recipe.yaml, then
+  `harnessblender pour <recipe> <drinker...>` again (it runs `install` + `update`, which is what
+  actually pulls the new version into the cache) — a Claude Code restart is still needed to apply
+  it, that part is a `claude` limitation.
 - **"Turn this into a skill"** → create `pantry/skills/<namespace>/<name>/SKILL.md` capturing the
   approach just used, add it to a recipe's selections, `harnessblender blend <recipe>`.
 - **"Remove `<ingredient>`"** → drop it from the recipe's `selections` (via `harnessblender
@@ -90,6 +103,9 @@ each plugin ingredient separately) — verified to work fully non-interactively.
   the ingredient itself (in `pantry/` or `store/`) untouched — only the recipe's selection changes.
 - **"Uninstall this from project X entirely"** → in X: `claude plugin uninstall
   <recipe>@<cookbook-name> --scope <scope>`.
+- **"Delete recipe `<name>`"** → `harnessblender delete-recipe <name>` (removes `recipe.yaml` +
+  `blend/`, drops it from `marketplace.json`). Drinkers that already installed it keep working
+  until explicitly uninstalled there (see above).
 
 ## Skill anatomy
 
@@ -112,9 +128,11 @@ short.
 harnessblender init <path>                    # scaffold a new, empty cookbook
 harnessblender new-recipe <name>              # picker, writes recipe.yaml + blends immediately
 harnessblender edit-recipe <name>             # picker, current selection pre-checked
+harnessblender delete-recipe <name>           # remove recipe.yaml + blend/ (confirms unless -y)
 harnessblender blend <name>                   # rebuild blend/ from recipe.yaml, no picker
 harnessblender list                           # all recipes + their status
 harnessblender fetch                          # clone-if-missing + ff-only pull of store.yaml sources
+harnessblender remove-store <name>            # drop a store.yaml source (checkout + entry + refs)
 harnessblender pour <name> <drinker...>       # install a blend into project(s)
 harnessblender web                            # browser picker
 harnessblender --cookbook <path> <cmd> ...    # explicit cookbook, instead of marker-file lookup
@@ -125,7 +143,9 @@ Without `--cookbook`, harnessblender walks up from the current directory looking
 
 ## Pitfalls
 
-- **"My change isn't showing up"** → `blend` wasn't run, or it wasn't re-poured + `/plugin reload`.
+- **"My change isn't showing up"** → check in order: `blend` wasn't run; the recipe's `version:`
+  wasn't bumped (Claude Code caches plugin content per version — same version = no-op, see above);
+  it wasn't re-poured (`pour` again after the bump); or Claude Code wasn't restarted after that.
 - **Never edit inside `recipes/<name>/blend/`** — it's a copy, `blend` overwrites without warning.
 - **`fetch` deliberately skips dirty/detached/diverged store checkouts** — resolve those by hand
   first, it never force-merges or auto-stashes.

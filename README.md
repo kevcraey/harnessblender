@@ -31,9 +31,11 @@ claude plugin install harnessblender@harnessblender --scope user -y
 ./harnessblender init <path>                # scaffold a new, empty cookbook
 ./harnessblender new-recipe <name>          # picker → recipe.yaml → blend
 ./harnessblender edit-recipe <name>         # picker, pre-checked → re-blend
+./harnessblender delete-recipe <name>       # remove recipe.yaml + blend/ (confirms unless -y)
 ./harnessblender blend <name>               # rebuild blend/ from recipe.yaml, no picker
 ./harnessblender list                       # all recipes + blended status
 ./harnessblender fetch                      # clone-if-missing + ff-only pull every store.yaml source
+./harnessblender remove-store <name>        # drop a store.yaml source (checkout + entry + recipe refs)
 ./harnessblender pour <name> <drinker...>   # install a blend into project folder(s)
 ./harnessblender web                        # browser picker
 ```

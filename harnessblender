@@ -122,6 +122,58 @@ def load_store() -> list[dict]:
     return (yaml.safe_load(path.read_text()) or {}).get("sources") or []
 
 
+def write_store(sources: list[dict]) -> None:
+    lines = [
+        "# External sources harnessblender can fetch (\"store items\"). Each `name` is cloned to",
+        "# `store/<name>/` (gitignored) — `harnessblender fetch` clones if missing, ff-only pulls",
+        "# if it already exists.",
+        "#",
+        "# sources:",
+        "#   - name: some-skill-repo",
+        "#     url: git@github.com:someone/some-skill-repo.git",
+    ]
+    if not sources:
+        lines.append("sources: []")
+    else:
+        lines.append("sources:")
+        for s in sources:
+            lines.append(f"  - name: {s['name']}")
+            lines.append(f"    url: {s['url']}")
+    (ROOT / "store.yaml").write_text("\n".join(lines) + "\n")
+
+
+def remove_store_source(name: str, config: dict) -> None:
+    """Drop a store.yaml source entirely: delete its store/<name>/ checkout, remove the
+    store.yaml entry, and scrub it from every recipe's selections (re-blending affected ones).
+    There's no per-item removal inside a store checkout — see the pitfalls in the skill's docs
+    on why `store/` is never hand-edited; drop the whole source instead."""
+    sources = load_store()
+    remaining = [s for s in sources if s.get("name") != name]
+    if len(remaining) == len(sources):
+        raise ValueError(f"no such store source '{name}'")
+    write_store(remaining)
+
+    checkout = ROOT / "store" / name
+    if checkout.exists():
+        shutil.rmtree(checkout)
+
+    prefix = f"store/{name}/"
+    for rname in recipe_names():
+        mix = read_recipe(rname)
+        sels = mix.get("selections") or {}
+        changed = False
+        for plural in PLURALS:
+            entries = sels.get(plural) or []
+            kept = [e for e in entries if not str(e.get("source", "")).startswith(prefix)]
+            if len(kept) != len(entries):
+                sels[plural] = kept
+                changed = True
+        if changed:
+            mix["selections"] = sels
+            recipe_path(rname).write_text(yaml.safe_dump(mix, sort_keys=False))
+            apply(rname, read_recipe(rname), config)
+
+
 def scan_roots() -> list[str]:
     """Fixed scan bases: pantry/ + every store/<name>/. No more configurable scan_bases."""
     roots = ["pantry"]
@@ -426,10 +478,26 @@ def write_recipe(name: str, description: str, version: str, selected: list[Item]
         as_name = existing_as.get(key) or default_as(it)
         by_kind[plural].append({"source": relpath(it.source), "as": as_name})
 
-    data = {"description": description, "version": version, "selections": by_kind}
+    data = {"description": description, "version": version, "selections": by_kind,
+             "drinkers": existing.get("drinkers") or []}
     p = recipe_path(name)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+def set_drinkers(name: str, drinkers: list[dict]) -> None:
+    mix = read_recipe(name)
+    mix["drinkers"] = drinkers
+    recipe_path(name).write_text(yaml.safe_dump(mix, sort_keys=False))
+
+
+def upsert_drinkers(name: str, pairs: list[tuple[str, str]]) -> None:
+    mix = read_recipe(name)
+    by_path = {d["path"]: d for d in (mix.get("drinkers") or []) if d.get("path")}
+    for path, scope in pairs:
+        by_path[path] = {"path": path, "scope": scope}
+    mix["drinkers"] = list(by_path.values())
+    recipe_path(name).write_text(yaml.safe_dump(mix, sort_keys=False))
 
 
 def recipe_names() -> list[str]:
@@ -824,6 +892,41 @@ def cmd_edit_recipe(args) -> None:
     print(f"updated recipe '{args.recipe}', re-blended: {summary(mix, has_hook)}.")
 
 
+def delete_recipe(name: str, config: dict) -> None:
+    """Remove recipes/<name>/ (recipe.yaml + blend/) and drop it from marketplace.json.
+    Does not touch drinkers it was already poured into — see `claude plugin uninstall`."""
+    shutil.rmtree(recipe_dir(name))
+    write_marketplace_json(config)
+
+
+def rename_recipe(old: str, new: str, config: dict) -> None:
+    """Rename recipes/<old>/ -> recipes/<new>/ (recipe.yaml, blend/, drinkers — all of it moves
+    together) and re-blend under the new name so plugin.json/marketplace.json follow along.
+    Drinkers that already installed the old plugin id keep it until poured again."""
+    if not new or new.startswith(".") or "/" in new or os.sep in new:
+        raise ValueError("invalid recipe name")
+    if not recipe_path(old).exists():
+        raise ValueError(f"no such recipe '{old}'")
+    if recipe_dir(new).exists():
+        raise ValueError(f"recipe '{new}' already exists")
+    recipe_dir(old).rename(recipe_dir(new))
+    apply(new, read_recipe(new), config)
+
+
+def cmd_delete_recipe(args) -> None:
+    config = load_config()
+    if not recipe_path(args.recipe).exists():
+        sys.exit(f"no such recipe '{args.recipe}'.")
+    if not args.yes:
+        ok = questionary.confirm(
+            f"delete recipe '{args.recipe}' (recipe.yaml + blend/)?", default=False
+        ).ask()
+        if not ok:
+            sys.exit("cancelled.")
+    delete_recipe(args.recipe, config)
+    print(f"deleted recipe '{args.recipe}'.")
+
+
 def cmd_blend(args) -> None:
     config = load_config()
     if not recipe_path(args.recipe).exists():
@@ -974,14 +1077,30 @@ def cmd_fetch(args) -> None:
         print("No blend items were affected by these updates.")
 
 
+def cmd_remove_store(args) -> None:
+    config = load_config()
+    if not any(s.get("name") == args.name for s in load_store()):
+        sys.exit(f"no such store source '{args.name}'.")
+    if not args.yes:
+        ok = questionary.confirm(
+            f"remove store source '{args.name}' (store.yaml entry + store/{args.name}/ checkout)?",
+            default=False,
+        ).ask()
+        if not ok:
+            sys.exit("cancelled.")
+    remove_store_source(args.name, config)
+    print(f"removed store source '{args.name}'.")
+
+
 # ── pour: install a blend into a project via the Claude Code CLI ───────────
 
 def pour_targets(recipe: str) -> list[str]:
     """Install ids for a recipe: the main blend (if it has skills/agents/guidelines/mcps)
     plus each plugin ingredient separately (its own name from its own plugin.json — never
-    merged, see rebuild_plugins())."""
+    merged, see rebuild_plugins()). Raises ValueError on failure — callers decide how to
+    surface that (CLI: sys.exit, web: HTTP error)."""
     if not blend_dir(recipe).exists():
-        sys.exit(f"recipe '{recipe}' has not been blended yet — run `harnessblender blend {recipe}` first.")
+        raise ValueError(f"recipe '{recipe}' has not been blended yet — run `harnessblender blend {recipe}` first.")
     mix = read_recipe(recipe)
     c = counts(mix)
     ids: list[str] = []
@@ -994,33 +1113,57 @@ def pour_targets(recipe: str) -> list[str]:
             if manifest.exists():
                 ids.append(json.loads(manifest.read_text())["name"])
     if not ids:
-        sys.exit(f"recipe '{recipe}' has nothing to pour (empty selections).")
+        raise ValueError(f"recipe '{recipe}' has nothing to pour (empty selections).")
     return ids
+
+
+def pour_one(recipe: str, market: str, ids: list[str], drinker: str, scope: str) -> dict:
+    """Pour into a single drinker: `claude plugin marketplace add` + one `install` per id.
+    Never raises — reports success/failure per id in the returned log."""
+    target = Path(drinker).expanduser().resolve()
+    if not target.is_dir():
+        return {"drinker": drinker, "ok": False, "log": f"skip {drinker}: not a directory"}
+    lines = [f"== pouring '{recipe}' ({', '.join(ids)}) into {target} (scope={scope}) =="]
+    add = subprocess.run(["claude", "plugin", "marketplace", "add", str(ROOT)],
+                         cwd=target, capture_output=True, text=True)
+    if add.returncode != 0:
+        lines.append(f"  marketplace add: {add.stdout.strip() or add.stderr.strip()} (continuing — likely already added)")
+    ok = True
+    for plugin_id in ids:
+        install = subprocess.run(
+            ["claude", "plugin", "install", f"{plugin_id}@{market}", "--scope", scope, "-y"],
+            cwd=target, capture_output=True, text=True)
+        if install.returncode != 0:
+            ok = False
+            lines.append(f"  ERROR ({plugin_id}): {install.stdout.strip() or install.stderr.strip()}")
+            continue
+        # `install` on an already-installed plugin is a no-op — it does NOT pick up new content
+        # even if the recipe's blend changed. `update` is what actually refreshes it to the
+        # version currently advertised by the marketplace (still needs a Claude Code restart
+        # to take effect — that's a `claude` limitation, not something harnessblender can do).
+        update = subprocess.run(
+            ["claude", "plugin", "update", f"{plugin_id}@{market}", "--scope", scope, "-y"],
+            cwd=target, capture_output=True, text=True)
+        if update.returncode != 0:
+            ok = False
+            lines.append(f"  ERROR ({plugin_id}) update: {update.stdout.strip() or update.stderr.strip()}")
+        else:
+            lines.append(f"  {plugin_id}: {update.stdout.strip() or install.stdout.strip() or 'poured.'}")
+    return {"drinker": drinker, "ok": ok, "log": "\n".join(lines)}
 
 
 def cmd_pour(args) -> None:
     config = load_config()
     market = config.get("name") or ROOT.name
-    ids = pour_targets(args.recipe)
+    try:
+        ids = pour_targets(args.recipe)
+    except ValueError as e:
+        sys.exit(str(e))
 
     for drinker in args.drinkers:
-        target = Path(drinker).expanduser().resolve()
-        if not target.is_dir():
-            print(f"skip {drinker}: not a directory", file=sys.stderr)
-            continue
-        print(f"== pouring '{args.recipe}' ({', '.join(ids)}) into {target} (scope={args.scope}) ==")
-        add = subprocess.run(["claude", "plugin", "marketplace", "add", str(ROOT)],
-                             cwd=target, capture_output=True, text=True)
-        if add.returncode != 0:
-            print(f"  marketplace add: {add.stdout.strip() or add.stderr.strip()} (continuing — likely already added)")
-        for plugin_id in ids:
-            install = subprocess.run(
-                ["claude", "plugin", "install", f"{plugin_id}@{market}", "--scope", args.scope, "-y"],
-                cwd=target, capture_output=True, text=True)
-            if install.returncode != 0:
-                print(f"  ERROR ({plugin_id}): {install.stdout.strip() or install.stderr.strip()}", file=sys.stderr)
-            else:
-                print(f"  {plugin_id}: {install.stdout.strip() or 'poured.'}")
+        result = pour_one(args.recipe, market, ids, drinker, args.scope)
+        print(result["log"], file=sys.stderr if not result["ok"] else sys.stdout)
+    upsert_drinkers(args.recipe, [(d, args.scope) for d in args.drinkers])
 
 
 # ── web UI (stdlib only) ─────────────────────────────────────────────────────
@@ -1043,6 +1186,7 @@ def list_variants() -> list[dict]:
             "description": mix.get("description", ""),
             "counts": counts(mix),
             "sources": sources,
+            "drinkers": mix.get("drinkers") or [],
         })
     return out
 
@@ -1057,6 +1201,7 @@ def web_state(items: list[Item], config: dict) -> dict:
         "variants": list_variants(),
         "scan_bases": scan_roots(),
         "exclude_dirs": list(config.get("exclude_dirs") or []),
+        "store_sources": load_store(),
     }
 
 
@@ -1102,6 +1247,78 @@ def save_variant(config: dict, items: list[Item], payload: dict) -> dict:
     return {"ok": True, "counts": counts(mix), "hook": has_hook}
 
 
+def open_target(kind: str, source: Path) -> Path:
+    """Resolve the file a browser "open" click should actually launch — a skill/agent
+    directory opens its SKILL.md / <name>.md, everything else opens as-is."""
+    if kind == "skill" and source.is_dir():
+        return source / "SKILL.md"
+    if kind == "agent" and source.is_dir():
+        return source / f"{source.name}.md"
+    return source
+
+
+def delete_target(kind: str, root_label: str, name: str, source: Path) -> Path:
+    """The actual file/dir to remove for an ingredient. For most kinds `source` already IS
+    the whole ingredient; an mcp Item's source is just the config file discovery matched
+    (e.g. `<wrapper>/.claude-plugin/.mcp.json`) — reconstruct the whole `<wrapper>/` dir."""
+    if kind == "mcp":
+        return ROOT / root_label / name
+    return source
+
+
+def delete_ingredient(kind: str, root_label: str, name: str, source: Path, config: dict) -> None:
+    """Delete an ingredient's real files from the pantry, then scrub it from every recipe's
+    selections (re-blending any recipe that referenced it). Refuses store/ sources — those are
+    gitignored checkouts, never edited directly (see `fetch`); remove the store.yaml entry instead."""
+    if Path(root_label).parts[:1] != ("pantry",):
+        raise ValueError("only pantry ingredients can be deleted here — edit store.yaml for store/ sources")
+    target = delete_target(kind, root_label, name, source).resolve()
+    if ROOT != target and ROOT not in target.parents:
+        raise ValueError("refusing to delete outside the cookbook")
+    if target.is_dir():
+        shutil.rmtree(target)
+    elif target.exists():
+        target.unlink()
+
+    rel = relpath(source)
+    for rname in recipe_names():
+        mix = read_recipe(rname)
+        sels = mix.get("selections") or {}
+        changed = False
+        for plural in PLURALS:
+            entries = sels.get(plural) or []
+            kept = [e for e in entries if e.get("source") != rel]
+            if len(kept) != len(entries):
+                sels[plural] = kept
+                changed = True
+        if changed:
+            mix["selections"] = sels
+            recipe_path(rname).write_text(yaml.safe_dump(mix, sort_keys=False))
+            apply(rname, read_recipe(rname), config)
+
+
+def open_in_os(path: Path) -> None:
+    """Open a local file/dir with whatever the OS considers its default app."""
+    if sys.platform == "darwin":
+        subprocess.run(["open", str(path)])
+    elif sys.platform.startswith("win"):
+        os.startfile(str(path))  # noqa: S606 — Windows-only API
+    else:
+        subprocess.run(["xdg-open", str(path)])
+
+
+def pick_folder() -> str | None:
+    """Native folder-picker dialog. Returns the chosen absolute path, or None if cancelled
+    (or unsupported on this OS — only macOS is implemented, matching the rest of this tool)."""
+    if sys.platform != "darwin":
+        return None
+    script = 'POSIX path of (choose folder with prompt "Pick a drinker project folder")'
+    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
+
+
 def make_handler(config: dict):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_a):
@@ -1137,18 +1354,90 @@ def make_handler(config: dict):
                 self._static(self.path.lstrip("/"))
 
         def do_POST(self):
-            if self.path not in ("/api/save", "/api/config"):
+            if self.path not in ("/api/save", "/api/config", "/api/delete", "/api/delete-source",
+                                  "/api/remove-store", "/api/open", "/api/set-drinkers", "/api/pour-one",
+                                  "/api/pick-folder", "/api/rename-recipe"):
                 self.send_error(404)
                 return
             length = int(self.headers.get("content-length") or 0)
             try:
                 payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/api/rename-recipe":
+                    old = (payload.get("old") or "").strip()
+                    new = (payload.get("new") or "").strip()
+                    rename_recipe(old, new, config)
+                    self._json(web_state(discover_sources(scan_roots(), config.get("exclude_dirs")), config))
+                    return
+                if self.path == "/api/pick-folder":
+                    path = pick_folder()
+                    if path is None:
+                        raise ValueError("cancelled or unsupported on this OS")
+                    self._json({"path": path})
+                    return
+                if self.path == "/api/open":
+                    rel = payload.get("source") or ""
+                    src = (ROOT / rel).resolve()
+                    if ROOT not in src.parents and src != ROOT or not src.exists():
+                        raise ValueError(f"no such source '{rel}'")
+                    open_in_os(open_target(payload.get("kind") or "", src))
+                    self._json({"ok": True})
+                    return
+                if self.path == "/api/delete-source":
+                    rel = payload.get("source") or ""
+                    src = (ROOT / rel).resolve()
+                    if ROOT not in src.parents and src != ROOT or not src.exists():
+                        raise ValueError(f"no such source '{rel}'")
+                    delete_ingredient(payload.get("kind") or "", payload.get("root_label") or "",
+                                       payload.get("name") or "", src, config)
+                    items = discover_sources(scan_roots(), config.get("exclude_dirs"))
+                    self._json(web_state(items, config))
+                    return
+                if self.path == "/api/set-drinkers":
+                    name = (payload.get("variant") or "").strip()
+                    if not name or not recipe_path(name).exists():
+                        raise ValueError(f"no such recipe '{name}'")
+                    drinkers = [{"path": d.get("path"), "scope": d.get("scope") or "local"}
+                                for d in (payload.get("drinkers") or []) if d.get("path")]
+                    set_drinkers(name, drinkers)
+                    self._json(web_state(discover_sources(scan_roots(), config.get("exclude_dirs")), config))
+                    return
+                if self.path == "/api/pour-one":
+                    name = (payload.get("variant") or "").strip()
+                    path = (payload.get("path") or "").strip()
+                    scope = payload.get("scope") or "local"
+                    if not name or not recipe_path(name).exists():
+                        raise ValueError(f"no such recipe '{name}'")
+                    if not path:
+                        raise ValueError("drinker path required")
+                    market = config.get("name") or ROOT.name
+                    ids = pour_targets(name)
+                    result = pour_one(name, market, ids, path, scope)
+                    if result["ok"]:
+                        upsert_drinkers(name, [(path, scope)])
+                    self._json(result, code=200 if result["ok"] else 500)
+                    return
+                if self.path == "/api/remove-store":
+                    name = (payload.get("name") or "").strip()
+                    if not any(s.get("name") == name for s in load_store()):
+                        raise ValueError(f"no such store source '{name}'")
+                    remove_store_source(name, config)
+                    items = discover_sources(scan_roots(), config.get("exclude_dirs"))
+                    self._json(web_state(items, config))
+                    return
                 if self.path == "/api/config":
                     raw = payload.get("exclude_dirs") or []
                     clean = sorted({str(x).strip() for x in raw if str(x).strip() and "/" not in str(x)})
                     config["exclude_dirs"] = clean
                     write_config(config)
                     items = discover_sources(scan_roots(), clean)
+                    self._json(web_state(items, config))
+                    return
+                if self.path == "/api/delete":
+                    name = (payload.get("variant") or "").strip()
+                    if not name or not recipe_path(name).exists():
+                        raise ValueError(f"no such recipe '{name}'")
+                    delete_recipe(name, config)
+                    items = discover_sources(scan_roots(), config.get("exclude_dirs"))
                     self._json(web_state(items, config))
                     return
                 items = discover_sources(scan_roots(), config.get("exclude_dirs"))
@@ -1202,6 +1491,11 @@ def main() -> None:
     pe.add_argument("recipe")
     pe.set_defaults(func=cmd_edit_recipe)
 
+    pd = sub.add_parser("delete-recipe", help="delete a recipe (recipe.yaml + blend/)")
+    pd.add_argument("recipe")
+    pd.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    pd.set_defaults(func=cmd_delete_recipe)
+
     pb = sub.add_parser("blend", help="(re)build a blend from its recipe (no picker)")
     pb.add_argument("recipe")
     pb.set_defaults(func=cmd_blend)
@@ -1211,6 +1505,11 @@ def main() -> None:
 
     pf = sub.add_parser("fetch", help="clone-if-missing + ff-only pull every store.yaml source, report stale blends")
     pf.set_defaults(func=cmd_fetch)
+
+    prs = sub.add_parser("remove-store", help="remove a store.yaml source (checkout + entry + recipe references)")
+    prs.add_argument("name")
+    prs.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    prs.set_defaults(func=cmd_remove_store)
 
     pp = sub.add_parser("pour", help="install a blend into one or more drinkers (project folders)")
     pp.add_argument("recipe")
